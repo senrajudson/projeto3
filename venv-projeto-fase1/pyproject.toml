@@ -1,0 +1,28 @@
+[project]
+name = "venv-projeto-fase1"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "senrajudson",email = "judsonnascimento.filho@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi (>=0.115.12,<0.116.0)",
+    "sqlalchemy (>=2.0.41,<3.0.0)",
+    "alembic (>=1.15.2,<2.0.0)",
+    "uvicorn (>=0.34.2,<0.35.0)",
+    "selenium (>=4.32.0,<5.0.0)",
+    "python-dotenv (>=1.1.0,<2.0.0)",
+    "passlib[bcrypt] (>=1.7.4,<2.0.0)",
+    "python-jose (>=3.4.0,<4.0.0)",
+    "playwright (>=1.52.0,<2.0.0)"
+]
+
+[tool.poetry]
+packages = [{include = "venv_projeto_fase1", from = "src"}]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
