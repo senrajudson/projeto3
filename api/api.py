@@ -20,9 +20,9 @@ def ensure_chromium_installed() -> None:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        print("✅ Playwright Chromium instalado.")
+        print("Playwright Chromium instalado.")
     except subprocess.CalledProcessError as e:
-        print("❌ Falha ao instalar o Chromium:", e)
+        print("Falha ao instalar o Chromium:", e)
         sys.exit(1)
 
 
