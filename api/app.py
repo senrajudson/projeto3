@@ -8,7 +8,7 @@ import pandas as pd
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright, TimeoutError
 
-from log_utils import load_query_log, log_query
+from logs.log_utils import load_query_log, log_query
 from db.db_utils import init_db, save_scrape_results, query_scrape_results
 
 
