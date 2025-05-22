@@ -1,39 +1,49 @@
-import asyncio
+from fastapi import FastAPI, Query, HTTPException
+from contextlib import asynccontextmanager
+from typing import List, Tuple, Sequence
+# import asyncio
 import subprocess
 import sys
-from typing import Tuple, Sequence
 
 import pandas as pd
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright, TimeoutError
 
-from log_utils import log_query  # importamos apenas o que precisamos
+from log_utils import log_query
 
-def ensure_chromium_installed() -> None:
-    """
-    Garante que o Chromium do Playwright esteja instalado.
-    Se não estiver, instala via `playwright install chromium`.
-    """
+
+# Lifespan handler para startup/shutdown
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: garante instalação do Chromium
     try:
         subprocess.run(
             [sys.executable, "-m", "playwright", "install", "chromium"],
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
     except subprocess.CalledProcessError as e:
         print("❌ Falha ao instalar o Chromium:", e)
         sys.exit(1)
+    yield
+    # Shutdown: nada a fazer
+
+
+app = FastAPI(
+    title="Embrapa Scraper API",
+    description="API para realizar scraping das abas do site da Embrapa e logar consultas",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
 
 async def _scrape_year(page, year: int) -> pd.DataFrame:
-    """
-    Busca dados de um ano, monta DataFrame com as linhas de corpo + total.
-    """
     await page.fill("input.text_pesq", str(year), timeout=2000)
     await page.press("input.text_pesq", "Enter")
     try:
         await page.wait_for_selector("table.tb_base.tb_dados", timeout=5000)
     except TimeoutError:
-        print(f"Ano {year}: tabela não carregou a tempo.")
         return pd.DataFrame()
 
     soup = BeautifulSoup(await page.content(), "lxml")
@@ -42,11 +52,11 @@ async def _scrape_year(page, year: int) -> pd.DataFrame:
         return pd.DataFrame()
 
     headers = [th.get_text(strip=True) for th in table.select("thead th")]
-    rows = [
-        [td.get_text(strip=True) for td in tr.select("td")]
-        for tr in table.select("tbody tr")
-    ]
-    rows = [r for r in rows if len(r) == len(headers)]
+    rows = []
+    for tr in table.select("tbody tr"):
+        cols = [td.get_text(strip=True) for td in tr.select("td")]
+        if len(cols) == len(headers):
+            rows.append(cols)
 
     total = [td.get_text(strip=True) for td in table.select("tfoot td")]
     if len(total) == len(headers):
@@ -57,14 +67,10 @@ async def _scrape_year(page, year: int) -> pd.DataFrame:
     return df
 
 
-async def fetch_production_data(
+async def fetch_scrape(
     interval: Tuple[int, int],
-    info: Sequence[str] = ("Produção",)
+    tabs: Sequence[str]
 ) -> pd.DataFrame:
-    """
-    Faz scraping da(s) aba(s) em `info` para todos os anos do intervalo,
-    concatena e retorna um DataFrame único.
-    """
     start_year, end_year = sorted(interval)
     years = range(start_year, end_year + 1)
 
@@ -80,15 +86,15 @@ async def fetch_production_data(
         except TimeoutError:
             pass
 
-        for tab_label in info:
+        for label in tabs:
             try:
-                await page.click(f'button:has-text("{tab_label}")', timeout=2000)
+                await page.click(f'button:has-text("{label}")', timeout=2000)
             except TimeoutError:
-                print(f"Aba '{tab_label}' não encontrada.")
+                print(f"Aba/subaba '{label}' não encontrada.")
 
         dfs = []
-        for year in years:
-            df_year = await _scrape_year(page, year)
+        for y in years:
+            df_year = await _scrape_year(page, y)
             if not df_year.empty:
                 dfs.append(df_year)
 
@@ -97,18 +103,27 @@ async def fetch_production_data(
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
 
-def main() -> None:
-    ensure_chromium_installed()
+@app.get("/scrape", summary="Realiza scraping e retorna dados em JSON")
+async def scrape_endpoint(
+    start: int = Query(..., ge=1970, le=2023, description="Ano inicial da consulta"),
+    end: int = Query(..., ge=1970, le=2023, description="Ano final da consulta"),
+    tabs: List[str] = Query(
+        ..., description="Lista de abas/subabas (ex: ['Produção','Vinhos de mesa'])"
+    ),
+):
+    interval = (start, end)
+    try:
+        df = await fetch_scrape(interval, tabs)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro no scraping: {e}")
 
-    intervalo = (2015, 2020)
-    aba = "Produção"
+    for tab_path in tabs:
+        log_query(tab_path, interval)
 
-    df = asyncio.run(fetch_production_data(intervalo, info=(aba,)))
-    log_query(aba, intervalo)
-
-    print(df)
-    # df.to_csv("producoes_2015_2020.csv", index=False)
+    data = df.to_dict(orient="records")
+    return {"count": len(data), "data": data}
 
 
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    uvicorn.run("main_api:app", host="0.0.0.0", port=8000, reload=True)
