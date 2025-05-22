@@ -8,7 +8,9 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, sessionmaker
 
+
 Base = declarative_base()
+
 
 class ScrapeRecord(Base):
     __tablename__ = "scrape_records"
@@ -19,6 +21,7 @@ class ScrapeRecord(Base):
     year = Column(Integer, nullable=False)
     data = Column(Text, nullable=False)  # armazena o row como JSON
 
+
 def init_db(db_path: str = "scraping.db") -> Session:
     """
     Cria o arquivo .db (se não existir) e retorna uma Session ligada a ele.
@@ -27,6 +30,7 @@ def init_db(db_path: str = "scraping.db") -> Session:
     engine = create_engine(f"sqlite:///{db_path}", future=True)
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine, future=True)()
+
 
 def save_scrape_results(
     session: Session,
@@ -56,6 +60,7 @@ def save_scrape_results(
     except SQLAlchemyError as e:
         session.rollback()
         raise
+
 
 def query_scrape_results(
     session: Session,
