@@ -14,10 +14,15 @@ from db.db_utils import init_db, save_scrape_results, query_scrape_results
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """
+    Lifespan handler: garante que o Playwright Chromium esteja instalado no startup.
+    """
     try:
         subprocess.run(
             [sys.executable, "-m", "playwright", "install", "chromium"],
-            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
     except subprocess.CalledProcessError as e:
         print("❌ Falha ao instalar o Chromium:", e)
@@ -34,6 +39,16 @@ app = FastAPI(
 
 
 async def _scrape_year(page, year: int) -> pd.DataFrame:
+    """
+    Carrega e extrai os dados de uma tabela para um ano específico.
+
+    Args:
+        page: instância de Playwright Page já navegada até a aba correta.
+        year: ano a ser pesquisado.
+
+    Returns:
+        DataFrame contendo as linhas do corpo e a linha de total para aquele ano.
+    """
     await page.fill("input.text_pesq", str(year), timeout=2000)
     await page.press("input.text_pesq", "Enter")
 
@@ -68,6 +83,16 @@ async def fetch_scrape(
     interval: Tuple[int, int],
     tabs: Sequence[str]
 ) -> pd.DataFrame:
+    """
+    Executa o scraping para cada ano no intervalo e concatena os resultados.
+
+    Args:
+        interval: tupla (ano_inicial, ano_final).
+        tabs: lista de labels de aba e subaba, na ordem.
+
+    Returns:
+        DataFrame com todas as linhas concatenadas para o intervalo.
+    """
     start_year, end_year = sorted(interval)
     years = range(start_year, end_year + 1)
 
@@ -91,8 +116,8 @@ async def fetch_scrape(
                 raise HTTPException(status_code=404, detail=f"Aba/subaba '{label}' não encontrada")
 
         dfs = []
-        for y in years:
-            df_year = await _scrape_year(page, y)
+        for year in years:
+            df_year = await _scrape_year(page, year)
             if not df_year.empty:
                 dfs.append(df_year)
 
@@ -102,6 +127,15 @@ async def fetch_scrape(
 
 
 def get_cached_years(tabs: Sequence[str]) -> set[int]:
+    """
+    Retorna o conjunto de anos já cacheados para o caminho de abas fornecido.
+
+    Args:
+        tabs: lista de labels de aba e subaba.
+
+    Returns:
+        Conjunto de anos presentes no log JSON para aquele caminho.
+    """
     log = load_query_log()
     node = log
     for key in tabs:
@@ -117,10 +151,26 @@ def get_cached_years(tabs: Sequence[str]) -> set[int]:
     summary="Realiza scraping com cache e retorna JSON"
 )
 async def scrape_endpoint(
-    start: int = Query(..., ge=1970, le=2023, description="Ano inicial"),
-    end: int = Query(..., ge=1970, le=2023, description="Ano final"),
-    tabs: List[str] = Query(..., description="Caminho de abas e subabas, ex ['Produção','Vinhos de mesa']")
+    start: int = Query(..., ge=1970, le=2023, description="Ano inicial (até 2023)"),
+    end: int = Query(..., ge=1970, le=2023, description="Ano final (até 2023)"),
+    tabs: List[str] = Query(
+        ...,
+        description="Caminho de abas e subabas, ex: ['Produção','Vinhos de mesa']"
+    )
 ):
+    """
+    Endpoint que retorna dados de scraping para as abas/subabas informadas,
+    aproveitando cache em SQLite para anos já consultados.
+
+    Query Params:
+        start: ano inicial da consulta
+        end: ano final da consulta
+        tabs: lista de abas e subabas a navegar antes do scrape
+
+    Retorna:
+        JSON com 'count' e 'data', onde 'data' é uma lista de objetos
+        correspondentes às linhas extraídas.
+    """
     interval = (start, end)
     session = init_db("scraping.db")
 
