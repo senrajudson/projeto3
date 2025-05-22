@@ -1,6 +1,6 @@
 from fastapi import FastAPI, Query, HTTPException
 from contextlib import asynccontextmanager
-from typing import List, Tuple, Sequence
+from typing import List, Tuple, Sequence, Optional
 import subprocess
 import sys
 
@@ -8,9 +8,7 @@ import pandas as pd
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright, TimeoutError
 
-from logs.log_utils import load_query_log, log_query
-from db.db_utils import init_db, save_scrape_results, query_scrape_results
-
+from db.db_utils import init_db, save_scrape_results, query_scrape_results, ScrapeRecord
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -40,14 +38,7 @@ app = FastAPI(
 
 async def _scrape_year(page, year: int) -> pd.DataFrame:
     """
-    Carrega e extrai os dados de uma tabela para um ano específico.
-
-    Args:
-        page: instância de Playwright Page já navegada até a aba correta.
-        year: ano a ser pesquisado.
-
-    Returns:
-        DataFrame contendo as linhas do corpo e a linha de total para aquele ano.
+    Extrai os dados da tabela para um ano específico.
     """
     await page.fill("input.text_pesq", str(year), timeout=2000)
     await page.press("input.text_pesq", "Enter")
@@ -85,13 +76,6 @@ async def fetch_scrape(
 ) -> pd.DataFrame:
     """
     Executa o scraping para cada ano no intervalo e concatena os resultados.
-
-    Args:
-        interval: tupla (ano_inicial, ano_final).
-        tabs: lista de labels de aba e subaba, na ordem.
-
-    Returns:
-        DataFrame com todas as linhas concatenadas para o intervalo.
     """
     start_year, end_year = sorted(interval)
     years = range(start_year, end_year + 1)
@@ -113,7 +97,8 @@ async def fetch_scrape(
             try:
                 await page.click(f'button:has-text("{label}")', timeout=2000)
             except TimeoutError:
-                raise HTTPException(status_code=404, detail=f"Aba/subaba '{label}' não encontrada")
+                raise HTTPException(status_code=404,
+                                    detail=f"Aba/subaba '{label}' não encontrada")
 
         dfs = []
         for year in years:
@@ -126,24 +111,23 @@ async def fetch_scrape(
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
 
-def get_cached_years(tabs: Sequence[str]) -> set[int]:
+def get_cached_years_db(
+    session,
+    main_tab: str,
+    subtab: Optional[str]
+) -> set[int]:
     """
-    Retorna o conjunto de anos já cacheados para o caminho de abas fornecido.
-
-    Args:
-        tabs: lista de labels de aba e subaba.
-
-    Returns:
-        Conjunto de anos presentes no log JSON para aquele caminho.
+    Retorna o conjunto de anos já persistidos no banco para a combinação
+    de aba e subaba informadas.
     """
-    log = load_query_log()
-    node = log
-    for key in tabs:
-        if isinstance(node, dict) and key in node:
-            node = node[key]
-        else:
-            return set()
-    return set(node) if isinstance(node, list) else set()
+    years = set()
+    query = session.query(ScrapeRecord.year).filter(
+        ScrapeRecord.tab == main_tab
+    )
+    if subtab:
+        query = query.filter(ScrapeRecord.subtab == subtab)
+    results = query.distinct().all()
+    return {r[0] for r in results}
 
 
 @app.get(
@@ -159,22 +143,24 @@ async def scrape_endpoint(
     )
 ):
     """
-    Endpoint que retorna dados de scraping para as abas/subabas informadas,
-    aproveitando cache em SQLite para anos já consultados.
+    Retorna dados de scraping para as abas/subabas informadas,
+    usando cache em SQLite para evitar buscas repetidas.
 
-    Query Params:
-        start: ano inicial da consulta
-        end: ano final da consulta
-        tabs: lista de abas e subabas a navegar antes do scrape
+    - **start**: ano inicial da consulta
+    - **end**: ano final da consulta
+    - **tabs**: lista de abas e subabas a navegar antes do scrape
 
-    Retorna:
-        JSON com 'count' e 'data', onde 'data' é uma lista de objetos
-        correspondentes às linhas extraídas.
+    Retorna JSON com:
+    - **count**: número de registros retornados
+    - **data**: lista de objetos com os dados extraídos
     """
     interval = (start, end)
     session = init_db("scraping.db")
 
-    cached = get_cached_years(tabs)
+    main_tab = tabs[0]
+    subtab = "/".join(tabs[1:]) if len(tabs) > 1 else None
+
+    cached = get_cached_years_db(session, main_tab, subtab)
     requested = set(range(start, end + 1))
     missing = sorted(requested - cached)
 
@@ -182,13 +168,8 @@ async def scrape_endpoint(
         for year in missing:
             df_new = await fetch_scrape((year, year), tabs)
             if not df_new.empty:
-                main_tab = tabs[0]
-                subtab = "/".join(tabs[1:]) if len(tabs) > 1 else None
                 save_scrape_results(session, main_tab, df_new, subtab=subtab)
-            log_query(tabs, (year, year))
 
-    main_tab = tabs[0]
-    subtab = "/".join(tabs[1:]) if len(tabs) > 1 else None
     df_all = query_scrape_results(session, main_tab, interval, subtab=subtab)
 
     return {
