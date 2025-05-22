@@ -1,14 +1,61 @@
-from fastapi import FastAPI, Query, HTTPException
+from fastapi import FastAPI, Query, HTTPException, Depends, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from contextlib import asynccontextmanager
 from typing import List, Tuple, Sequence, Optional
 import subprocess
 import sys
+from datetime import datetime, timedelta
 
 import pandas as pd
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright, TimeoutError
+from pydantic import BaseModel
+from passlib.context import CryptContext
+from jose import JWTError, jwt
 
 from db.db_utils import init_db, save_scrape_results, query_scrape_results, ScrapeRecord
+from db.db_users import (
+    get_db,
+    get_user_db,
+    create_user_db,
+    authenticate_user_db,
+    User as UserModel,
+)
+
+
+# JWT config
+SECRET_KEY = "YOUR_SECRET_KEY"  # troque em produção!
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+
+class TokenData(BaseModel):
+    username: Optional[str] = None
+
+
+class User(BaseModel):
+    username: str
+    full_name: Optional[str] = None
+    disabled: Optional[bool] = False
+
+
+class UserInDB(User):
+    hashed_password: str
+
+
+class UserCreate(BaseModel):
+    username: str
+    password: str
+    full_name: Optional[str] = None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -30,10 +77,86 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Embrapa Scraper API",
-    description="Scraping das abas do site da Embrapa com cache em SQLite",
+    description="Scraping das abas do site da Embrapa com cache em SQLite e JWT auth",
     version="1.0.0",
     lifespan=lifespan,
 )
+
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+async def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db=Depends(get_db)
+) -> UserModel:
+    credentials_exc = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Não foi possível validar credenciais",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if not username:
+            raise credentials_exc
+    except JWTError:
+        raise credentials_exc
+    user = get_user_db(db, username)
+    if not user:
+        raise credentials_exc
+    return user
+
+
+def get_current_active_user(
+    current_user: UserModel = Depends(get_current_user)
+) -> UserModel:
+    if current_user.disabled:
+        raise HTTPException(status_code=400, detail="Usuário inativo")
+    return current_user
+
+
+@app.post("/users", response_model=User, status_code=201, summary="Cria novo usuário")
+def create_user(
+    user_in: UserCreate,
+    db=Depends(get_db)
+):
+    """
+    Cria um novo usuário com senha.
+    """
+    existing = get_user_db(db, user_in.username)
+    if existing:
+        raise HTTPException(status_code=400, detail="Usuário já existe")
+    user = create_user_db(
+        db,
+        username=user_in.username,
+        password=user_in.password,
+        full_name=user_in.full_name
+    )
+    return User(username=user.username, full_name=user.full_name, disabled=user.disabled)
+
+
+@app.post("/token", response_model=Token, summary="Gera token JWT de acesso")
+async def login_for_access_token(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    db=Depends(get_db)
+):
+    """
+    Autentica usuário e retorna token JWT.
+    """
+    user = authenticate_user_db(db, form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Usuário ou senha incorretos",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = create_access_token(data={"sub": user.username})
+    return {"access_token": token, "token_type": "bearer"}
 
 
 async def _scrape_year(page, year: int) -> pd.DataFrame:
@@ -120,7 +243,6 @@ def get_cached_years_db(
     Retorna o conjunto de anos já persistidos no banco para a combinação
     de aba e subaba informadas.
     """
-    years = set()
     query = session.query(ScrapeRecord.year).filter(
         ScrapeRecord.tab == main_tab
     )
@@ -132,7 +254,8 @@ def get_cached_years_db(
 
 @app.get(
     "/scrape",
-    summary="Realiza scraping com cache e retorna JSON"
+    summary="Realiza scraping com cache e retorna JSON",
+    dependencies=[Depends(get_current_active_user)]
 )
 async def scrape_endpoint(
     start: int = Query(..., ge=1970, le=2023, description="Ano inicial (até 2023)"),
@@ -145,14 +268,6 @@ async def scrape_endpoint(
     """
     Retorna dados de scraping para as abas/subabas informadas,
     usando cache em SQLite para evitar buscas repetidas.
-
-    - **start**: ano inicial da consulta
-    - **end**: ano final da consulta
-    - **tabs**: lista de abas e subabas a navegar antes do scrape
-
-    Retorna JSON com:
-    - **count**: número de registros retornados
-    - **data**: lista de objetos com os dados extraídos
     """
     interval = (start, end)
     session = init_db("scraping.db")
