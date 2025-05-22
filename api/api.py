@@ -1,7 +1,7 @@
 import asyncio
 import subprocess
 import sys
-from typing import Tuple
+from typing import Sequence, Tuple
 
 import pandas as pd
 from bs4 import BeautifulSoup
@@ -10,7 +10,7 @@ from playwright.async_api import async_playwright, TimeoutError
 
 def ensure_chromium_installed() -> None:
     """
-    Garante que o Chromium do Playwright esteja instalado.
+    Garante que o Playwright Chromium está disponível.
     Se não estiver, instala via `playwright install chromium`.
     """
     try:
@@ -20,103 +20,112 @@ def ensure_chromium_installed() -> None:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        print("Playwright Chromium instalado.")
     except subprocess.CalledProcessError as e:
-        print("Falha ao instalar o Chromium:", e)
+        print("❌ Falha ao instalar o Chromium:", e)
         sys.exit(1)
 
 
-async def _scrape_year(page, year: int) -> pd.DataFrame:
+async def _scrape_year(page, year: int, *,
+                       table_timeout: int = 5_000) -> pd.DataFrame:
     """
-    Realiza a busca para um dado ano e retorna um DataFrame com os resultados,
-    incluindo a linha de total.
+    Preenche o campo de ano, aguarda a tabela e retorna um DataFrame
+    com as linhas de <tbody> + a linha de total de <tfoot>.
     """
-    # limpa e preenche o campo de pesquisa
-    await page.fill("input.text_pesq", str(year), timeout=2000)
+    # preenche e submete
+    await page.fill("input.text_pesq", str(year), timeout=2_000)
     await page.press("input.text_pesq", "Enter")
-    # aguarda a tabela renderizar
-    await page.wait_for_selector("table.tb_base.tb_dados", timeout=5000)
 
-    # parse do HTML
-    soup = BeautifulSoup(await page.content(), "lxml")
-    table = soup.find("table", class_="tb_base tb_dados")
-    if table is None:
-        return pd.DataFrame()  # ou lançar erro, conforme sua necessidade
+    # espera a tabela aparecer
+    try:
+        await page.wait_for_selector("table.tb_base.tb_dados", timeout=table_timeout)
+    except TimeoutError:
+        print(f"Ano {year}: tabela não carregou em {table_timeout} ms")
+        return pd.DataFrame()
 
-    # cabeçalhos
-    headers = [th.get_text(strip=True) for th in table.thead.find_all("th")]
+    html = await page.content()
+    soup = BeautifulSoup(html, "lxml")
+    table = soup.select_one("table.tb_base.tb_dados")
+    if not table:
+        return pd.DataFrame()
 
-    # linhas do corpo
-    rows = []
-    for tr in table.tbody.find_all("tr"):
-        cols = [td.get_text(strip=True) for td in tr.find_all("td")]
+    # cabeçalho
+    headers = [th.get_text(strip=True) for th in table.select("thead th")]
+
+    # corpo
+    data = []
+    for row in table.select("tbody tr"):
+        cols = [td.get_text(strip=True) for td in row.select("td")]
         if len(cols) == len(headers):
-            rows.append(cols)
+            data.append(cols)
 
-    # adiciona o total (tfoot)
-    total_cells = [td.get_text(strip=True) for td in table.tfoot.find_all("td")]
-    if len(total_cells) == len(headers):
-        rows.append(total_cells)
+    # total
+    total = [td.get_text(strip=True) for td in table.select("tfoot td")]
+    if len(total) == len(headers):
+        data.append(total)
 
-    # monta DataFrame e marca o ano
-    df = pd.DataFrame(rows, columns=headers)
+    df = pd.DataFrame(data, columns=headers)
     df["ano"] = year
     return df
 
 
-async def fetch_production_data(interval: Tuple[int, int]) -> pd.DataFrame:
+async def fetch_tab_data(
+    base_url: str,
+    years: Sequence[int],
+    *,
+    cookie_button_text: str = "Aceito",
+    tab_label: str = "Produção",
+) -> pd.DataFrame:
     """
-    Para cada ano no intervalo [start, end], faz o scraping da aba 'Produção'
-    e concatena todos os DataFrames num único.
+    Abre o browser, navega até base_url, aceita cookies (se houver),
+    clica na aba indicada por tab_label e faz _scrape_year para cada ano.
+    Retorna o concat de todos os DataFrames válidos.
     """
-    start_year, end_year = sorted(interval)
-    years = range(start_year, end_year + 1)
-
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
         page = await browser.new_page()
-        page.set_default_timeout(5000)
-        page.set_default_navigation_timeout(5000)
+        page.set_default_timeout(5_000)
+        page.set_default_navigation_timeout(5_000)
 
-        # navega até a página inicial
-        await page.goto("http://vitibrasil.cnpuv.embrapa.br/")
+        await page.goto(base_url)
 
-        # clica em "Aceito" se aparecer o banner de cookies
+        # aceita cookies sem travar no erro
         try:
-            await page.click('button:has-text("Aceito")', timeout=2000)
+            await page.click(f'button:has-text("{cookie_button_text}")', timeout=2_000)
         except TimeoutError:
             pass
 
-        # seleciona a aba Produção
-        await page.click('button:has-text("Produção")', timeout=2000)
+        # seleciona a aba
+        await page.click(f'button:has-text("{tab_label}")', timeout=2_000)
 
-        # coleta os dados ano a ano
+        # percorre os anos
         dfs = []
         for y in years:
-            df_year = await _scrape_year(page, y)
-            if not df_year.empty:
-                dfs.append(df_year)
+            df = await _scrape_year(page, y)
+            if not df.empty:
+                dfs.append(df)
 
         await browser.close()
 
-    # concatena e retorna
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
 
-def main():
-    # 1) Garante que o Chromium está instalado
+def main(interval: Tuple[int, int]) -> None:
+    # garante o browser instalado
     ensure_chromium_installed()
 
-    # 2) Define o intervalo de anos a buscar
-    intervalo = (2015, 2020)
+    # monta lista de anos
+    start, end = sorted(interval)
+    years = list(range(start, end + 1))
 
-    # 3) Dispara o scraping e recebe um único DataFrame
-    df = asyncio.run(fetch_production_data(intervalo))
+    # URL base e aba desejada
+    url = "http://vitibrasil.cnpuv.embrapa.br/"
+    df = asyncio.run(fetch_tab_data(url, years, tab_label="Produção"))
 
-    # 4) Exibe ou salva
+    # saída
     print(df)
-    # df.to_csv("producoes_2015_2020.csv", index=False)
+    # df.to_csv("producoes.csv", index=False)
 
 
 if __name__ == "__main__":
-    main()
+    # ex: rodar de 2015 até 2020
+    main((2015, 2020))
