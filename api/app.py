@@ -8,7 +8,7 @@ import pandas as pd
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright, TimeoutError
 
-from auth import router as auth_router, get_current_active_user
+from utils.auth import router as auth_router, get_current_active_user
 from db.db_utils import init_db, save_scrape_results, query_scrape_results, ScrapeRecord
 
 
