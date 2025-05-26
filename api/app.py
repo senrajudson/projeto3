@@ -2,6 +2,7 @@ from fastapi import FastAPI, Query, HTTPException, Depends
 from contextlib import asynccontextmanager
 from typing import List, Tuple, Sequence, Optional
 import subprocess
+import asyncio
 import sys
 
 import pandas as pd
@@ -36,6 +37,12 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+
+if sys.platform.startswith("win"):
+    from asyncio import WindowsSelectorEventLoopPolicy
+    asyncio.set_event_loop_policy(WindowsSelectorEventLoopPolicy())
+
 
 # registra o router de autenticação
 app.include_router(auth_router)
