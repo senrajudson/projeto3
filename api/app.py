@@ -1,9 +1,10 @@
 from contextlib import asynccontextmanager
 from typing import List, Tuple, Sequence, Optional
+import requests
 
 import pandas as pd
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, Query, HTTPException, Depends
+from fastapi import FastAPI, Query, Depends, HTTPException
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.common.exceptions import TimeoutException
@@ -74,58 +75,68 @@ def _scrape_year_selenium(driver: webdriver.Chrome, year: int) -> pd.DataFrame:
 
 
 def fetch_scrape_selenium(
-    interval: Tuple[int, int],
+    interval: Tuple[int,int],
     tabs: Sequence[str]
 ) -> pd.DataFrame:
-    """
-    Executa o scraping via Selenium para cada ano no intervalo e concatena resultados.
-    """
     start_year, end_year = sorted(interval)
 
-    chrome_options = Options()
-    chrome_options.add_argument("--headless")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--no-sandbox")
-
-    driver = webdriver.Chrome(options=chrome_options)
-    driver.set_window_size(1280, 800)
+    # configurações do Chrome headless
+    opts = Options()
+    opts.add_argument("--headless")
+    driver = webdriver.Chrome(options=opts)
     driver.get("http://vitibrasil.cnpuv.embrapa.br/")
-
     wait = WebDriverWait(driver, 10)
 
-    # clica em "Aceito" se aparecer o banner
+    # aceita cookies (se aparecer)
     try:
-        aceito_btn = wait.until(
-            EC.element_to_be_clickable((By.XPATH, "//button[normalize-space(text())='Aceito']"))
-        )
-        aceito_btn.click()
+        aceito = wait.until(EC.element_to_be_clickable(
+            (By.XPATH, "//button[normalize-space(text())='Aceito']")))
+        aceito.click()
     except:
         pass
 
-    # navega pelas abas/subabas
-    for label in tabs:
-        try:
-            btn = wait.until(
-                EC.element_to_be_clickable((
-                    By.XPATH,
-                    f"//button[normalize-space(text())='{label}']"
-                ))
-            )
-            btn.click()
-        except:
-            driver.quit()
-            # Em vez de RuntimeError, disparar HTTPException pra FastAPI
-            from fastapi import HTTPException
-            raise HTTPException(
-                status_code=404,
-                detail=f"Aba/subaba '{label}' não encontrada"
-            )
+    # 1) clicar no botão principal (classe btn_opt)
+    main_label = tabs[0]
+    # espera a barra de abas carregar
+    wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "p#row_btn")))
+    main_buttons = driver.find_elements(By.CSS_SELECTOR, "p#row_btn > button.btn_opt")
+    main_map = {b.text.strip(): b for b in main_buttons}
 
+    btn_main = main_map.get(main_label)
+    if not btn_main:
+        driver.quit()
+        raise HTTPException(404, f"Aba '{main_label}' não encontrada")
+    btn_main.click()
+
+    # 2) se houver sub-aba, clicar nela (classe btn_sopt)
+    if len(tabs) > 1:
+        sub_label = tabs[1]
+        # espera o container de sub-abas aparecer
+        wait.until(EC.presence_of_all_elements_located(
+            (By.CSS_SELECTOR, "button.btn_sopt")))
+        sub_buttons = driver.find_elements(By.CSS_SELECTOR, "button.btn_sopt")
+        sub_map = {b.text.strip(): b for b in sub_buttons}
+
+        btn_sub = sub_map.get(sub_label)
+        if not btn_sub:
+            driver.quit()
+            raise HTTPException(404, f"Sub-aba '{sub_label}' não encontrada")
+        btn_sub.click()
+
+    # 3) espera a tabela de dados carregar
+    try:
+        wait.until(EC.presence_of_element_located(
+            (By.CSS_SELECTOR, "table.tb_base.tb_dados")))
+    except:
+        driver.quit()
+        raise HTTPException(503, "Tabela de dados não carregou após selecionar aba")
+
+    # 4) agora raspagem ano a ano
     dfs = []
-    for year in range(start_year, end_year + 1):
-        df_year = _scrape_year_selenium(driver, year)
-        if not df_year.empty:
-            dfs.append(df_year)
+    for year in range(start_year, end_year+1):
+        df = _scrape_year_selenium(driver, year)  # sua função existente
+        if not df.empty:
+            dfs.append(df)
 
     driver.quit()
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
@@ -159,6 +170,13 @@ async def scrape_endpoint(
     Retorna dados de scraping para as abas/subabas informadas,
     usando cache em SQLite para evitar buscas repetidas.
     """
+
+    # === fallback rápido de disponibilidade do site ===
+    try:
+        requests.get("http://vitibrasil.cnpuv.embrapa.br/", timeout=5).raise_for_status()
+    except Exception:
+        raise HTTPException(503, "Site da Embrapa indisponível")
+
     interval = (start, end)
     session = init_db("scraping.db")
 
