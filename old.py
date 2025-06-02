@@ -1,4 +1,3 @@
-
 async def search_google(query: str):
     async with async_playwright() as p:
         # Lança o Chrome instalado no sistema em modo headless
@@ -6,8 +5,8 @@ async def search_google(query: str):
         page = await browser.new_page()
 
         # Define timeouts padrão (em ms)
-        page.set_default_timeout(20_000)            # 20 s para ações genéricas
-        page.set_default_navigation_timeout(30_000) # 30 s para navegações
+        page.set_default_timeout(20_000)  # 20 s para ações genéricas
+        page.set_default_navigation_timeout(30_000)  # 30 s para navegações
 
         # 1) Navega até o Google
         await page.goto("https://www.google.com")
@@ -25,12 +24,12 @@ async def search_google(query: str):
         await page.wait_for_selector("#search")
 
         # 5) Coleta os 10 primeiros resultados
-        results = await page.query_selector_all('#search .g')
+        results = await page.query_selector_all("#search .g")
         for idx, result in enumerate(results[:10], start=1):
-            title_el = await result.query_selector('h3')
+            title_el = await result.query_selector("h3")
             title = await title_el.inner_text() if title_el else "—"
-            link_el = await result.query_selector('a')
-            href = await link_el.get_attribute('href') if link_el else "—"
+            link_el = await result.query_selector("a")
+            href = await link_el.get_attribute("href") if link_el else "—"
             print(f"{idx}. {title}\n   {href}\n")
 
         await browser.close()

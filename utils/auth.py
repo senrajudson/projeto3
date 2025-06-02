@@ -20,7 +20,7 @@ from db.db_users import (
 )
 
 # --- Configurações de JWT ---
-SECRET_KEY = "YOUR_SECRET_KEY"       # troque em produção!
+SECRET_KEY = "YOUR_SECRET_KEY"  # troque em produção!
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
@@ -66,7 +66,7 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
 
 async def get_current_user(
     token: str = Depends(oauth2_scheme),
-    db = Depends(get_user_db_session),
+    db=Depends(get_user_db_session),
 ) -> UserModel:
     credentials_exc = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -94,10 +94,12 @@ def get_current_active_user(
     return current_user
 
 
-@router.post("/users", response_model=User, status_code=201, summary="Cria novo usuário")
+@router.post(
+    "/users", response_model=User, status_code=201, summary="Cria novo usuário"
+)
 def create_user(
     user_in: UserCreate,
-    db = Depends(get_user_db_session),
+    db=Depends(get_user_db_session),
 ):
     """
     Cria um novo usuário com senha.
@@ -121,7 +123,7 @@ def create_user(
 @router.post("/token", response_model=Token, summary="Gera token JWT de acesso")
 async def login_for_access_token(
     form_data: OAuth2PasswordRequestForm = Depends(),
-    db = Depends(get_user_db_session),
+    db=Depends(get_user_db_session),
 ):
     """
     Autentica usuário e retorna token JWT.

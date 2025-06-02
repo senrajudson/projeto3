@@ -1,4 +1,5 @@
 import json
+
 # from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -33,15 +34,12 @@ def init_db(db_path: str = "scraping.db") -> Session:
 
 
 def save_scrape_results(
-    session: Session,
-    tab: str,
-    df: pd.DataFrame,
-    subtab: Optional[str] = None
+    session: Session, tab: str, df: pd.DataFrame, subtab: Optional[str] = None
 ) -> None:
     """
-    Salva cada linha do DataFrame como um ScrapeRecord.  
-    - `tab`: nome da aba principal  
-    - `subtab`: nome da sub-aba (se houver)  
+    Salva cada linha do DataFrame como um ScrapeRecord.
+    - `tab`: nome da aba principal
+    - `subtab`: nome da sub-aba (se houver)
     """
     try:
         records = []
@@ -52,7 +50,7 @@ def save_scrape_results(
                 tab=tab,
                 subtab=subtab,
                 year=int(row["ano"]),
-                data=json.dumps(row_dict, ensure_ascii=False)
+                data=json.dumps(row_dict, ensure_ascii=False),
             )
             records.append(rec)
         session.add_all(records)
@@ -63,10 +61,7 @@ def save_scrape_results(
 
 
 def query_scrape_results(
-    session: Session,
-    tab: str,
-    interval: Tuple[int, int],
-    subtab: Optional[str] = None
+    session: Session, tab: str, interval: Tuple[int, int], subtab: Optional[str] = None
 ) -> pd.DataFrame:
     """
     Consulta todos os ScrapeRecord que casem com aba, sub-aba (se fornecida)
@@ -74,8 +69,7 @@ def query_scrape_results(
     """
     start, end = sorted(interval)
     stmt = select(ScrapeRecord).where(
-        ScrapeRecord.tab == tab,
-        ScrapeRecord.year.between(start, end)
+        ScrapeRecord.tab == tab, ScrapeRecord.year.between(start, end)
     )
     if subtab is not None:
         stmt = stmt.where(ScrapeRecord.subtab == subtab)
@@ -94,4 +88,3 @@ def query_scrape_results(
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame(rows)
-

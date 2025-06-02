@@ -18,9 +18,11 @@ references_dict = []
 with open(json_path, "r", encoding="utf-8") as f:
     references_dict = json.load(f)
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
+
 
 app = FastAPI(
     title="Embrapa Scraper API",
@@ -30,6 +32,7 @@ app = FastAPI(
 )
 
 app.include_router(auth_router)
+
 
 def _scrape_year_bs4(base_url: str, year: int) -> pd.DataFrame:
     try:
@@ -60,6 +63,7 @@ def _scrape_year_bs4(base_url: str, year: int) -> pd.DataFrame:
     df["ano"] = year
     return df
 
+
 def resolve_url_from_tabs(tabs: Sequence[str]) -> Optional[str]:
     node = references_dict
     for key in tabs:
@@ -69,10 +73,13 @@ def resolve_url_from_tabs(tabs: Sequence[str]) -> Optional[str]:
             return None
     return node if isinstance(node, str) else None
 
-def fetch_scrape_bs4(interval: Tuple[int,int], tabs: Sequence[str]) -> pd.DataFrame:
+
+def fetch_scrape_bs4(interval: Tuple[int, int], tabs: Sequence[str]) -> pd.DataFrame:
     target_url = resolve_url_from_tabs(tabs)
     if target_url is None:
-        raise HTTPException(status_code=404, detail=f"Aba/subaba {tabs!r} não encontrada no mapeamento")
+        raise HTTPException(
+            status_code=404, detail=f"Aba/subaba {tabs!r} não encontrada no mapeamento"
+        )
 
     start_year, end_year = sorted(interval)
     dfs = []
@@ -83,31 +90,35 @@ def fetch_scrape_bs4(interval: Tuple[int,int], tabs: Sequence[str]) -> pd.DataFr
 
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
+
 def get_cached_years_db(session, main_tab: str, subtab: Optional[str]) -> set[int]:
     q = session.query(ScrapeRecord.year).filter(ScrapeRecord.tab == main_tab)
     if subtab:
         q = q.filter(ScrapeRecord.subtab == subtab)
     return {r[0] for r in q.distinct().all()}
 
+
 @app.get(
     "/scrape",
     summary="Realiza scraping com cache e retorna JSON",
-    dependencies=[Depends(get_current_active_user)]
+    dependencies=[Depends(get_current_active_user)],
 )
 async def scrape_endpoint(
     start: int = Query(..., ge=1970, le=2023, description="Ano inicial (até 2023)"),
-    end:   int = Query(..., ge=1970, le=2023, description="Ano final (até 2023)"),
-    tabs:  List[str] = Query(..., description="Caminho de abas/subabas, e.g. ['Produção','Vinhos de mesa']")
+    end: int = Query(..., ge=1970, le=2023, description="Ano final (até 2023)"),
+    tabs: List[str] = Query(
+        ..., description="Caminho de abas/subabas, e.g. ['Produção','Vinhos de mesa']"
+    ),
 ):
     interval = (start, end)
     session = init_db("scraping.db")
 
     main_tab = tabs[0]
-    subtab   = "/".join(tabs[1:]) if len(tabs) > 1 else None
+    subtab = "/".join(tabs[1:]) if len(tabs) > 1 else None
 
-    cached   = get_cached_years_db(session, main_tab, subtab)
-    requested= set(range(start, end + 1))
-    missing  = sorted(requested - cached)
+    cached = get_cached_years_db(session, main_tab, subtab)
+    requested = set(range(start, end + 1))
+    missing = sorted(requested - cached)
 
     for year in missing:
         df_new = await run_in_threadpool(fetch_scrape_bs4, (year, year), tabs)
@@ -117,6 +128,8 @@ async def scrape_endpoint(
     df_all = query_scrape_results(session, main_tab, interval, subtab=subtab)
     return {"count": len(df_all), "data": df_all.to_dict(orient="records")}
 
+
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("api.app:app", host="0.0.0.0", port=8000, reload=True)

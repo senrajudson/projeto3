@@ -12,9 +12,7 @@ from passlib.context import CryptContext
 
 # 1) Configurações do banco de usuários
 DATABASE_URL = "sqlite:///./scraping.db"  # ou outro caminho que você escolha
-engine = create_engine(
-    DATABASE_URL, connect_args={"check_same_thread": False}
-)
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
@@ -49,6 +47,7 @@ def get_db() -> Generator[Session, None, None]:
 
 # 6) Operações sobre User
 
+
 def get_user_db(db: Session, username: str) -> Optional[User]:
     return db.query(User).filter(User.username == username).first()
 
@@ -73,9 +72,7 @@ def create_user_db(
     return user
 
 
-def authenticate_user_db(
-    db: Session, username: str, password: str
-) -> Optional[User]:
+def authenticate_user_db(db: Session, username: str, password: str) -> Optional[User]:
     user = get_user_db(db, username)
     if not user or not pwd_context.verify(password, user.hashed_password):
         return None
