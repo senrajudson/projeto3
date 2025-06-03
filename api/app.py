@@ -1,3 +1,5 @@
+# api/app.py
+
 from contextlib import asynccontextmanager
 from typing import List, Tuple, Sequence, Optional
 import os
@@ -43,7 +45,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Registra as rotas de autenticação
+# Registra as rotas de autenticação (POST /users, POST /token)
 app.include_router(auth_router)
 
 
