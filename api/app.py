@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from typing import List, Tuple, Sequence, Optional
+import os
 import requests
 import json
 from pathlib import Path
@@ -12,12 +13,13 @@ from starlette.concurrency import run_in_threadpool
 from mangum import Mangum
 
 from utils.auth import router as auth_router, get_current_active_user
+
+# Importa as funções de banco mas só será usado se NÃO estivermos no Vercel
 from db.db_utils import init_db, save_scrape_results, query_scrape_results, ScrapeRecord
 
-# Localiza o arquivo JSON com as referências de URLs
+# Carrega references.json (mapeamento de abas/subabas → URLs)
 BASE_DIR = Path(__file__).parent
 json_path = BASE_DIR / "references.json"
-
 with open(json_path, "r", encoding="utf-8") as f:
     references_dict = json.load(f)
 
@@ -33,20 +35,22 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Embrapa Scraper API",
-    description="Scraping com requests+BeautifulSoup das abas do site da Embrapa "
-                "com cache em SQLite e JWT (rodando em Vercel + Mangum)",
+    description=(
+        "Scraping com requests+BeautifulSoup das abas do site da Embrapa "
+        "com opção de cache em SQLite e JWT (rodando em Vercel + Mangum)"
+    ),
     version="1.0.0",
     lifespan=lifespan,
 )
 
-# Registra as rotas de autenticação (login, criação de usuário, etc).
+# Registra as rotas de autenticação
 app.include_router(auth_router)
 
 
 def _scrape_year_bs4(base_url: str, year: int) -> pd.DataFrame:
     """
     Extrai a tabela do ano específico a partir de uma URL base (requests + BS4).
-    Se houver erro HTTP ou timeout na requisição, lança HTTPException 503.
+    Lança HTTPException(503) se der erro de rede ou timeout.
     """
     try:
         response = requests.post(base_url, data={"ano": str(year)}, timeout=120)
@@ -63,7 +67,7 @@ def _scrape_year_bs4(base_url: str, year: int) -> pd.DataFrame:
     headers = [th.get_text(strip=True) for th in table.select("thead th")]
 
     # Extrai linhas do corpo (tbody > tr > td)
-    rows = []
+    rows: List[List[str]] = []
     for tr in table.select("tbody tr"):
         cols = [td.get_text(strip=True) for td in tr.select("td")]
         if len(cols) == len(headers):
@@ -81,9 +85,8 @@ def _scrape_year_bs4(base_url: str, year: int) -> pd.DataFrame:
 
 def resolve_url_from_tabs(tabs: Sequence[str]) -> Optional[str]:
     """
-    Dado um caminho de abas/subabas (lista de strings), faz lookup no dicionário
-    carregado de references.json e devolve a URL correspondente (string),
-    ou None se não encontrar correspondência.
+    Dado um caminho de abas/subabas (lista de strings), faz lookup em references_dict
+    e devolve a URL correspondente (string), ou None se não encontrar.
     """
     node = references_dict
     for key in tabs:
@@ -96,8 +99,8 @@ def resolve_url_from_tabs(tabs: Sequence[str]) -> Optional[str]:
 
 def fetch_scrape_bs4(interval: Tuple[int, int], tabs: Sequence[str]) -> pd.DataFrame:
     """
-    Executa _scrape_year_bs4 ano a ano no intervalo fornecido, concatena em um DataFrame.
-    Se não encontrar URL para a combinação de tabs, lança 404.
+    Executa _scrape_year_bs4 ano a ano no intervalo e concatena num DataFrame.
+    Se não encontrar URL para estas tabs, lança 404.
     """
     target_url = resolve_url_from_tabs(tabs)
     if target_url is None:
@@ -118,8 +121,7 @@ def fetch_scrape_bs4(interval: Tuple[int, int], tabs: Sequence[str]) -> pd.DataF
 
 def get_cached_years_db(session, main_tab: str, subtab: Optional[str]) -> set[int]:
     """
-    Retorna o conjunto de anos já persistidos no banco para a combinação
-    de aba e subaba informadas.
+    Retorna o conjunto de anos já persistidos no banco para a combinação de aba e subaba.
     """
     query = session.query(ScrapeRecord.year).filter(ScrapeRecord.tab == main_tab)
     if subtab:
@@ -130,65 +132,87 @@ def get_cached_years_db(session, main_tab: str, subtab: Optional[str]) -> set[in
 
 @app.get(
     "/scrape",
-    summary="Realiza scraping com cache e retorna JSON",
+    summary="Realiza scraping com cache (se habilitado) e retorna JSON",
     dependencies=[Depends(get_current_active_user)],
 )
 async def scrape_endpoint(
     start: int = Query(..., ge=1970, le=2023, description="Ano inicial (até 2023)"),
-    end: int = Query(..., ge=1970, le=2023, description="Ano final (até 2023)"),
-    tabs: List[str] = Query(
-        ..., description="Caminho de abas/subabas, e.g. ['Produção','Vinhos de mesa']"
-    ),
+    end:   int = Query(..., ge=1970, le=2023, description="Ano final (até 2023)"),
+    tabs:  List[str] = Query(
+        ..., description="Caminho de abas/subabas, ex: ['Produção','Vinhos de mesa']"
+    )
 ):
     """
-    Retorna dados de scraping para as abas/subabas informadas,
-    usando cache em SQLite para evitar buscas repetidas.
+    Retorna dados de scraping para as abas/subabas informadas.
 
-    - **start**: ano inicial da consulta
-    - **end**: ano final da consulta
-    - **tabs**: lista de abas e subabas para mapear a URL exata no references.json
-
-    Workflow:
-    1. Verifica no banco (SQLite) quais anos daquele intervalo e combinação já existem.
-    2. Para cada ano faltante, chama fetch_scrape_bs4 em background thread (run_in_threadpool).
-    3. Armazena resultados novos no banco.
-    4. Retorna todos os dados do intervalo (consulta unificada no banco).
-
-    Exemplo de chamada no Postman (GET):
-    GET https://<sua-vercel-url>/api/scrape?start=2015&end=2020&tabs=Exportação&tabs=Vinhos%20de%20mesa
-    Header:
-        Authorization: Bearer <seu_jwt>
+    **Funcionalidades**:
+    - Verifica disponibilidade do site da Embrapa (503 se indisponível).
+    - Se NÃO estivermos rodando em Vercel (variável VERCEL != "1"), usa SQLite para cache:
+        1. Checa quais anos deste intervalo JÁ estão no banco.
+        2. Para cada ano faltante, faz scraping (requests+BS4) em background thread.
+        3. Salva resultados novos no SQLite.
+        4. Retorna todos os anos do intervalo vindos do banco.
+    - Se estivermos em Vercel (VERCEL="1"), PULA o cache em SQLite:
+        1. Simplesmente faz scraping de todos os anos (requests+BS4) na hora.
+        2. Não grava/consulta nada no SQLite.
     """
-    # 1) Checar disponibilidade do site (fallback rápido)
+    # 1) Checa disponibilidade do site (fallback rápido)
     try:
         requests.get("http://vitibrasil.cnpuv.embrapa.br/", timeout=15).raise_for_status()
     except Exception:
         raise HTTPException(status_code=503, detail="Site da Embrapa indisponível")
 
     interval = (start, end)
-    session = init_db("scraping.db")
+    running_on_vercel = os.environ.get("VERCEL") == "1"
+
+    # Se NÃO estivermos em Vercel, inicializa o banco
+    if not running_on_vercel:
+        session = init_db("scraping.db")
+    else:
+        session = None  # não usaremos
 
     main_tab = tabs[0]
     subtab = "/".join(tabs[1:]) if len(tabs) > 1 else None
 
-    # 2) Determina quais anos já estão no cache (SQLite)
-    cached = get_cached_years_db(session, main_tab, subtab)
-    requested = set(range(start, end + 1))
-    missing = sorted(requested - cached)
+    # **Lógica de cache só se session não for None**:
+    if session is not None:
+        # 2a) Determina anos já cacheados
+        cached = get_cached_years_db(session, main_tab, subtab)
+        requested = set(range(start, end + 1))
+        missing = sorted(requested - cached)
 
-    # 3) Para cada ano faltante, faz scraping e salva no banco
-    for year in missing:
-        df_new = await run_in_threadpool(fetch_scrape_bs4, (year, year), tabs)
-        if not df_new.empty:
-            save_scrape_results(session, main_tab, df_new, subtab=subtab)
+        # 3a) Para cada ano faltante, faz scraping e salva no banco
+        for year in missing:
+            df_new = await run_in_threadpool(fetch_scrape_bs4, (year, year), tabs)
+            if not df_new.empty:
+                save_scrape_results(session, main_tab, df_new, subtab=subtab)
 
-    # 4) Recupera do banco todos os anos no intervalo e retorna
-    df_all = query_scrape_results(session, main_tab, interval, subtab=subtab)
-    return {"count": len(df_all), "data": df_all.to_dict(orient="records")}
+        # 4a) Recupera do banco todos os anos no intervalo
+        df_all = query_scrape_results(session, main_tab, interval, subtab=subtab)
+
+    else:
+        # **Estamos em Vercel**: pulamos o cache e fazemos scraping direto de todos os anos
+        df_list: List[pd.DataFrame] = []
+        start_year, end_year = sorted(interval)
+        for year in range(start_year, end_year + 1):
+            # cada ano separado
+            df_year = await run_in_threadpool(fetch_scrape_bs4, (year, year), tabs)
+            if not df_year.empty:
+                df_list.append(df_year)
+        if df_list:
+            df_all = pd.concat(df_list, ignore_index=True)
+        else:
+            df_all = pd.DataFrame()
+
+    return {
+        "count": len(df_all),
+        "data": df_all.to_dict(orient="records")
+    }
 
 
-# Handler WSGI para rodar sob AWS Lambda (via Vercel)
+# Handler WSGI para AWS Lambda / Vercel
 handler = Mangum(app)
+
 
 if __name__ == "__main__":
     import uvicorn
