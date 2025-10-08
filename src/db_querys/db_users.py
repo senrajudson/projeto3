@@ -10,9 +10,10 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from passlib.context import CryptContext
 
-# 1) Configurações do banco de usuários
-DATABASE_URL = "sqlite:///./scraping.db"  # ou outro caminho que você escolha
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+# 1) Configurações do banco PostgreSQL (usa variáveis fixas ou os.getenv)
+DATABASE_URL = "postgresql://user:password@db:5432/projeto3"
+
+engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
@@ -21,7 +22,7 @@ Base = declarative_base()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
-# 3) Model
+# 3) Modelo
 class User(Base):
     __tablename__ = "users"
 
@@ -32,11 +33,11 @@ class User(Base):
     disabled = Column(Boolean, default=False)
 
 
-# 4) Cria a tabela (execute apenas uma vez, no import)
+# 4) Cria a tabela (execute uma vez)
 Base.metadata.create_all(bind=engine)
 
 
-# 5) Dependência para injetar sessão no FastAPI
+# 5) Dependência para injetar a sessão no FastAPI
 def get_db() -> Generator[Session, None, None]:
     db = SessionLocal()
     try:
@@ -45,9 +46,7 @@ def get_db() -> Generator[Session, None, None]:
         db.close()
 
 
-# 6) Operações sobre User
-
-
+# 6) Operações CRUD
 def get_user_db(db: Session, username: str) -> Optional[User]:
     return db.query(User).filter(User.username == username).first()
 

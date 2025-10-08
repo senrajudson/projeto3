@@ -22,43 +22,24 @@ class ScrapeRecord(Base):
     data = Column(Text, nullable=False)  # armazena o row como JSON
 
 
-def init_db(db_filename: str = "scraping.db") -> Session:
+def init_db(database_url: Optional[str] = None) -> Session:
     """
-    Cria (ou abre) um arquivo SQLite e retorna uma Session ligada a ele.
+    Inicializa a conexão com o banco PostgreSQL (ou outro) via SQLAlchemy.
+    Retorna uma session.
+    """
 
-    - Se estivermos em Vercel/AWS Lambda (detected via VERCEL=1 ou AWS_LAMBDA_FUNCTION_NAME),
-      o arquivo será criado em /tmp/<db_filename> (diretório gravável em serverless).
-    - Caso contrário (desenvolvimento local), o arquivo será criado ao lado do código:
-        ./<db_filename>
-    """
-    # Detecta se estamos rodando em Vercel (VERCEL=1) ou em Lambda (AWS_LAMBDA_FUNCTION_NAME)
-    running_on_serverless = (
-        os.environ.get("VERCEL") == "1"
-        or os.environ.get("AWS_LAMBDA_FUNCTION_NAME") is not None
+    # Tenta obter a URL do banco de variável de ambiente ou argumento
+    if database_url is None:
+        database_url = os.getenv(
+            "DATABASE_URL", "postgresql://user:password@db:5432/projeto3"
+        )
+
+    engine = create_engine(database_url, future=True)
+    SessionLocal = sessionmaker(
+        bind=engine, autoflush=False, autocommit=False, future=True
     )
 
-    if running_on_serverless:
-        # Em Lambda/Vercel, /tmp é o único diretório gravável
-        target_dir = Path("/tmp")
-        target_dir.mkdir(parents=True, exist_ok=True)  # garante que /tmp exista
-        db_path = target_dir / db_filename
-        database_url = f"sqlite:///{db_path}"
-    else:
-        # Em desenvolvimento local, criar o DB na raiz do projeto
-        project_root = Path(__file__).parent.parent  # assume que db_utils.py está em db/
-        db_path = project_root / db_filename
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        database_url = f"sqlite:///{db_path}"
-
-    # Cria engine e session
-    engine = create_engine(
-        database_url,
-        connect_args={"check_same_thread": False},  # necessário para SQLite + threads
-        future=True,
-    )
-    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
-
-    # Garante que as tabelas existam
+    # Cria as tabelas, se não existirem
     Base.metadata.create_all(bind=engine)
     return SessionLocal()
 
@@ -67,7 +48,7 @@ def save_scrape_results(
     session: Session, tab: str, df: pd.DataFrame, subtab: Optional[str] = None
 ) -> None:
     """
-    Salva cada linha do DataFrame como um ScrapeRecord no SQLite.
+    Salva cada linha do DataFrame como um ScrapeRecord no banco.
 
     Parâmetros:
     - session: objeto Session gerado por init_db()
@@ -99,7 +80,7 @@ def query_scrape_results(
     session: Session, tab: str, interval: Tuple[int, int], subtab: Optional[str] = None
 ) -> pd.DataFrame:
     """
-    Busca no banco todos os registros que pertençam à aba 'tab', 
+    Busca no banco todos os registros que pertençam à aba 'tab',
     sub-aba 'subtab' (se fornecida) e cujo ano esteja no intervalo [start, end].
 
     Retorna um DataFrame reconstruído, onde cada linha tem as colunas originais
