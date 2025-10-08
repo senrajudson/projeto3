@@ -192,16 +192,12 @@ def _build_yearly_totals(df_scrapes: pd.DataFrame) -> pd.DataFrame:
 
 def _add_desempenho_labels(df_yearly: pd.DataFrame) -> pd.DataFrame:
     """
-    Desempenho multiclasse (0/1/2) usando média móvel dos 3 ANOS ANTERIORES.
-    Regras:
-      - prod > média & exp > média → 1
-      - prod > média & exp < média → 0
-      - prod < média & exp > média → 2
-      - prod < média & exp < média → 1
+    Rótulo 0/1/2 via índice composto (produção e exportação vs média móvel 3 anos)
+    e discretização por quantis (tercis). Gera classes mais balanceadas.
     """
     df = df_yearly.sort_values("year").reset_index(drop=True).copy()
 
-    # Média móvel baseada SOMENTE nos anos anteriores (shift)
+    # médias móveis (3 anos ANTERIORES)
     df["prod_media_3"] = (
         df["producao_total"].shift(1).rolling(window=3, min_periods=2).mean()
     )
@@ -209,22 +205,37 @@ def _add_desempenho_labels(df_yearly: pd.DataFrame) -> pd.DataFrame:
         df["exportacao_total_usd"].shift(1).rolling(window=3, min_periods=2).mean()
     )
 
-    # mantém apenas anos com histórico suficiente (>= 2 anos anteriores)
     df = df.dropna(subset=["prod_media_3", "exp_media_3"]).copy()
 
-    def _label(r) -> int:
-        prod_maior = r["producao_total"] > r["prod_media_3"]
-        exp_maior = r["exportacao_total_usd"] > r["exp_media_3"]
-        if prod_maior and exp_maior:
-            return 1
-        elif prod_maior and not exp_maior:
-            return 0
-        elif (not prod_maior) and exp_maior:
-            return 2
-        else:
-            return 1
+    # desvios relativos (se denom = 0, vira 0)
+    def safe_rel(x, m):
+        return 0.0 if (m is None or m == 0 or pd.isna(m)) else (x - m) / m
 
-    df["desempenho"] = df.apply(_label, axis=1).astype(int)
+    df["prod_dev"] = [
+        safe_rel(p, m) for p, m in zip(df["producao_total"], df["prod_media_3"])
+    ]
+    df["exp_dev"] = [
+        safe_rel(e, m) for e, m in zip(df["exportacao_total_usd"], df["exp_media_3"])
+    ]
+
+    # índice composto (ajuste pesos se quiser)
+    df["score"] = 0.5 * df["prod_dev"] + 0.5 * df["exp_dev"]
+
+    # para evitar erro do qcut quando há muitos empates, use rank com jitter leve
+    s = df["score"].astype(float)
+    # se tudo igual, o rank protege:
+    if s.nunique(dropna=True) < 3:
+        s = s.rank(method="first")  # 1..N
+
+    # 3 faixas por quantis
+    try:
+        df["desempenho"] = pd.qcut(s, q=3, labels=[0, 1, 2]).astype(int)
+    except ValueError:
+        # fallback se qcut não conseguir por empates extremos: use cut em faixas iguais
+        df["desempenho"] = pd.cut(
+            s, bins=3, labels=[0, 1, 2], include_lowest=True
+        ).astype(int)
+
     return df[["year", "producao_total", "exportacao_total_usd", "desempenho"]]
 
 
