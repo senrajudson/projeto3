@@ -70,36 +70,37 @@ def _save_ml_metrics(
 
 
 def _ensure_etl_columns(engine):
-    """
-    Garante que a tabela etl_job existe e possui as colunas necessárias,
-    incluindo 'desempenho' para gravar a classificação.
-    """
     with engine.begin() as conn:
         conn.execute(
             text(
                 """
-                CREATE TABLE IF NOT EXISTS etl_job (
-                    year INT PRIMARY KEY,
-                    producao_vinhos_mesa DOUBLE PRECISION,
-                    exportacao_total_dols DOUBLE PRECISION
-                );
-                """
+            CREATE TABLE IF NOT EXISTS etl_job (
+                year INT PRIMARY KEY,
+                producao_vinhos_mesa DOUBLE PRECISION
+            );
+        """
             )
         )
-        # adiciona coluna de classificação, se não existir
         conn.execute(
             text(
                 """
-                DO $$
-                BEGIN
-                  IF NOT EXISTS (
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='etl_job' AND column_name='exportacao_total_dols'
+                ) THEN
+                    ALTER TABLE etl_job ADD COLUMN exportacao_total_dols DOUBLE PRECISION;
+                END IF;
+
+                IF NOT EXISTS (
                     SELECT 1 FROM information_schema.columns
                     WHERE table_name='etl_job' AND column_name='desempenho'
-                  ) THEN
+                ) THEN
                     ALTER TABLE etl_job ADD COLUMN desempenho INT;
-                  END IF;
-                END$$;
-                """
+                END IF;
+            END$$;
+        """
             )
         )
 
@@ -186,13 +187,42 @@ def run_and_save_ml() -> None:
     out_etl = etl.merge(cls_df[["year", "desempenho"]], on="year", how="left")
     with engine.begin() as conn:
         out_etl.to_sql("etl_job", con=conn, if_exists="replace", index=False)
+        # re-garante colunas e tipos
         conn.execute(
             text(
                 """
-            ALTER TABLE etl_job
-            ALTER COLUMN year TYPE INT USING year::INT,
-            ALTER COLUMN producao_vinhos_mesa TYPE DOUBLE PRECISION,
-            ALTER COLUMN exportacao_total_dols TYPE DOUBLE PRECISION
+            DO $$
+            BEGIN
+                -- garante colunas
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='etl_job' AND column_name='exportacao_total_dols'
+                ) THEN
+                    ALTER TABLE etl_job ADD COLUMN exportacao_total_dols DOUBLE PRECISION;
+                END IF;
+
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name='etl_job' AND column_name='desempenho'
+                ) THEN
+                    ALTER TABLE etl_job ADD COLUMN desempenho INT;
+                END IF;
+
+                -- ajusta tipos das colunas que existem
+                EXECUTE 'ALTER TABLE etl_job ALTER COLUMN year TYPE INT USING year::INT';
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name=''etl_job'' AND column_name=''producao_vinhos_mesa''
+                ) THEN
+                    EXECUTE 'ALTER TABLE etl_job ALTER COLUMN producao_vinhos_mesa TYPE DOUBLE PRECISION';
+                END IF;
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name=''etl_job'' AND column_name=''exportacao_total_dols''
+                ) THEN
+                    EXECUTE 'ALTER TABLE etl_job ALTER COLUMN exportacao_total_dols TYPE DOUBLE PRECISION';
+                END IF;
+            END$$;
         """
             )
         )

@@ -127,17 +127,20 @@ def _extract_export_usd_by_year(df_raw: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-# ----------------- Função 1: atualiza anos já existentes -----------------
 def run_etl_export_update(
     database_url: Optional[str] = None, return_df: bool = False
 ) -> Optional[pd.DataFrame]:
     """
-    Atualiza a coluna exportacao_total_dols em etl_job **apenas** para anos já existentes em etl_job.
+    Atualiza a coluna exportacao_total_dols em etl_job **apenas** para anos já existentes,
+    sem usar to_sql(..., replace). Evita perder colunas.
     """
     db_url = database_url or DATABASE_URL
     engine = create_engine(db_url, future=True, pool_pre_ping=True)
+
+    # Garante tabela e coluna alvo
     _ensure_target_table(engine)
 
+    # Lê anos existentes na etl_job
     with engine.begin() as conn:
         etl = pd.read_sql("SELECT * FROM etl_job", conn)
 
@@ -145,6 +148,8 @@ def run_etl_export_update(
         return etl if return_df else None
 
     years = sorted(etl["year"].dropna().astype(int).unique().tolist())
+
+    # Busca scrapes apenas desses anos
     with engine.begin() as conn:
         raw = pd.read_sql(
             text(
@@ -154,23 +159,25 @@ def run_etl_export_update(
             params={"years": years},
         )
 
+    # Extrai valores US$ por ano
     usd_by_year = _extract_export_usd_by_year(raw)
-    out = etl.merge(usd_by_year, on="year", how="left")
+    if usd_by_year.empty:
+        return etl if return_df else None
+
+    # UPDATE por ano (sem derrubar a tabela)
+    with engine.begin() as conn:
+        for _, r in usd_by_year.iterrows():
+            conn.execute(
+                text("UPDATE etl_job SET exportacao_total_dols=:usd WHERE year=:year"),
+                {"year": int(r["year"]), "usd": float(r["exportacao_total_dols"])},
+            )
+
+    if not return_df:
+        return None
 
     with engine.begin() as conn:
-        out.to_sql("etl_job", con=conn, if_exists="replace", index=False)
-        conn.execute(
-            text(
-                """
-            ALTER TABLE etl_job
-            ALTER COLUMN year TYPE INT USING year::INT,
-            ALTER COLUMN producao_vinhos_mesa TYPE DOUBLE PRECISION,
-            ALTER COLUMN exportacao_total_dols TYPE DOUBLE PRECISION;
-        """
-            )
-        )
-
-    return out if return_df else None
+        final_df = pd.read_sql("SELECT * FROM etl_job ORDER BY year", conn)
+    return final_df
 
 
 # ----------------- Função 2: UPSERT para todos os anos encontrados -----------------
