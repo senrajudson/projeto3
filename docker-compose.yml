@@ -13,6 +13,31 @@ services:
       - postgres_data:/var/lib/postgresql/data
     ports:
       - '5432:5432'
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U user -d projeto3 || exit 1']
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  projeto3:
+    build:
+      context: .
+      dockerfile: dockerfile
+    container_name: projeto3
+    restart: unless-stopped
+    working_dir: /app
+    command: uvicorn api.app:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ./src:/app
+    environment:
+      DATABASE_URL: postgresql://user:password@db:5432/projeto3
+      PYTHONUNBUFFERED: '1'
+    ports:
+      - '8000:8000'
+    depends_on:
+      db:
+        condition: service_healthy
 
   pgadministrator:
     image: dpage/pgadmin4
@@ -34,31 +59,13 @@ services:
     image: grafana/grafana
     container_name: grafana
     restart: unless-stopped
-    user: "472:472"                   # evita problema de permissão no volume
+    user: '472:472' # evita problema de permissão no volume
     ports:
-      - "3050:3000"                   # << aqui está o ajuste
+      - '3050:3000' # << aqui está o ajuste
     volumes:
       - grafana_data:/var/lib/grafana
     environment:
       GF_PATHS_DATA: /var/lib/grafana # ok para SQLite
-
-  projeto3:
-    build:
-      context: .
-      # troque para ./src/Dockerfile se o arquivo tiver D maiúsculo ou estiver na pasta src
-      dockerfile: dockerfile
-    container_name: projeto3
-    working_dir: /app
-    command: uvicorn api.app:app --host 0.0.0.0 --port 8000 --reload
-    volumes:
-      - ./src:/app
-    environment:
-      DATABASE_URL: postgresql://user:password@db:5432/projeto3
-      PYTHONUNBUFFERED: '1'
-    ports:
-      - '8000:8000'
-    depends_on:
-      - db
 
 volumes:
   postgres_data:
