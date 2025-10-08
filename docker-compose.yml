@@ -14,43 +14,49 @@ services:
     ports:
       - '5432:5432'
 
-  pgadmin:
+  pgadministrator:
     image: dpage/pgadmin4
-    container_name: pgadmin
+    container_name: pgadministrator
     restart: unless-stopped
     environment:
       PGADMIN_DEFAULT_EMAIL: admin@projeto3.local
       PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_ALLOW_SPECIAL_EMAIL_DOMAINS: '["projeto3.local","local","localhost"]'
+      PGADMIN_CONFIG_CHECK_EMAIL_DELIVERABILITY: 'False'
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
     ports:
       - '5050:80'
     depends_on:
       - db
-    volumes:
-      - pgadmin_data:/var/lib/pgadmin
 
   grafana:
     image: grafana/grafana
     container_name: grafana
     restart: unless-stopped
+    user: "472:472"                   # evita problema de permissão no volume
     ports:
-      - '3000:3000'
+      - "3050:3000"                   # << aqui está o ajuste
     volumes:
       - grafana_data:/var/lib/grafana
+    environment:
+      GF_PATHS_DATA: /var/lib/grafana # ok para SQLite
 
   projeto3:
     build:
       context: .
+      # troque para ./src/Dockerfile se o arquivo tiver D maiúsculo ou estiver na pasta src
       dockerfile: dockerfile
     container_name: projeto3
     working_dir: /app
     command: uvicorn api.app:app --host 0.0.0.0 --port 8000 --reload
     volumes:
       - ./src:/app
-    ports:
-      - '8000:8000'
     environment:
       DATABASE_URL: postgresql://user:password@db:5432/projeto3
       PYTHONUNBUFFERED: '1'
+    ports:
+      - '8000:8000'
     depends_on:
       - db
 

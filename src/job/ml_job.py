@@ -45,6 +45,10 @@ def _coerce_number_br(val: Any) -> Optional[float]:
 def _find_total_value_from_row(
     row_dict: Dict[str, Any], prefer_usd: bool = False
 ) -> Optional[float]:
+    """
+    Heurística para pegar 'total' em US$ (exportação) ou não-US$ (produção),
+    dependendo de prefer_usd.
+    """
     candidates: List[Tuple[str, float]] = []
     for k, v in row_dict.items():
         if v in (None, "", "-"):
@@ -80,6 +84,52 @@ def _find_total_value_from_row(
     return max(candidates, key=lambda kv: kv[1])[1]
 
 
+def _row_is_vinho_de_mesa(row_dict: Dict[str, Any]) -> bool:
+    """
+    Identifica se a linha representa 'Vinho(s) de Mesa)'.
+    Procura em colunas típicas (Produto / Categoria / Tipo) e, como fallback,
+    em qualquer valor textual.
+    """
+    targets = ["vinho de mesa", "vinhos de mesa"]
+    # checa colunas típicas
+    for key in row_dict.keys():
+        k = str(key).strip().lower()
+        if k in ("produto", "produto/derivado", "categoria", "tipo"):
+            val = str(row_dict.get(key, "")).strip().lower()
+            if any(t in val for t in targets):
+                return True
+    # fallback: procurar em QUALQUER valor textual
+    for v in row_dict.values():
+        if isinstance(v, str) and any(t in v.strip().lower() for t in targets):
+            return True
+    return False
+
+
+def _extract_total_non_usd(row_dict: Dict[str, Any]) -> Optional[float]:
+    """
+    Extrai um 'total' NÃO US$ (produção em litros/ton etc.) da linha.
+    """
+    candidates: List[float] = []
+    for k, v in row_dict.items():
+        if v in (None, "", "-"):
+            continue
+        key_norm = str(k).strip().lower()
+        if "total" in key_norm and ("us" not in key_norm and "u$" not in key_norm):
+            val = _coerce_number_br(v)
+            if val is not None and np.isfinite(val):
+                candidates.append(val)
+    if not candidates:
+        for k, v in row_dict.items():
+            if v in (None, "", "-"):
+                continue
+            key_norm = str(k).strip().lower()
+            if "total" in key_norm:
+                val = _coerce_number_br(v)
+                if val is not None and np.isfinite(val):
+                    candidates.append(val)
+    return max(candidates) if candidates else None
+
+
 def _load_scrapes_df(engine) -> pd.DataFrame:
     """
     Lê scrape_records como DataFrame:
@@ -97,7 +147,7 @@ def _load_scrapes_df(engine) -> pd.DataFrame:
 
 def _build_yearly_totals(df_scrapes: pd.DataFrame) -> pd.DataFrame:
     """
-    Produção total (sem US$) e Exportação total US$ por ano.
+    Produção (APENAS 'Vinho de Mesa', NÃO total) e Exportação total US$ por ano.
     Heurística:
       - tab começando com 'Produ' → produção
       - tab começando com 'Export' → exportação
@@ -124,10 +174,14 @@ def _build_yearly_totals(df_scrapes: pd.DataFrame) -> pd.DataFrame:
             agg[ano] = {"producao_total": 0.0, "exportacao_total_usd": 0.0}
 
         if tipo == "producao":
-            v = _find_total_value_from_row(data_dict, prefer_usd=False)
-            if v is not None and np.isfinite(v):
-                agg[ano]["producao_total"] += v
+            # SOMENTE "Vinho de Mesa"
+            if _row_is_vinho_de_mesa(data_dict):
+                v = _extract_total_non_usd(data_dict)
+                if v is not None and np.isfinite(v):
+                    agg[ano]["producao_total"] += v
+
         elif tipo == "exportacao":
+            # Exportação: total em US$
             v = _find_total_value_from_row(data_dict, prefer_usd=True)
             if v is not None and np.isfinite(v):
                 agg[ano]["exportacao_total_usd"] += v
@@ -138,7 +192,7 @@ def _build_yearly_totals(df_scrapes: pd.DataFrame) -> pd.DataFrame:
 
 def _add_desempenho_labels(df_yearly: pd.DataFrame) -> pd.DataFrame:
     """
-    Desempenho multiclasse (0/1/2) usando média móvel (janela=5, min_periods=3) dos 5 anos ANTERIORES.
+    Desempenho multiclasse (0/1/2) usando média móvel dos 3 ANOS ANTERIORES.
     Regras:
       - prod > média & exp > média → 1
       - prod > média & exp < média → 0
@@ -147,19 +201,20 @@ def _add_desempenho_labels(df_yearly: pd.DataFrame) -> pd.DataFrame:
     """
     df = df_yearly.sort_values("year").reset_index(drop=True).copy()
 
-    df["prod_media_5"] = (
-        df["producao_total"].shift(1).rolling(window=5, min_periods=3).mean()
+    # Média móvel baseada SOMENTE nos anos anteriores (shift)
+    df["prod_media_3"] = (
+        df["producao_total"].shift(1).rolling(window=3, min_periods=2).mean()
     )
-    df["exp_media_5"] = (
-        df["exportacao_total_usd"].shift(1).rolling(window=5, min_periods=3).mean()
+    df["exp_media_3"] = (
+        df["exportacao_total_usd"].shift(1).rolling(window=3, min_periods=2).mean()
     )
 
-    # mantém apenas anos com histórico suficiente
-    df = df.dropna(subset=["prod_media_5", "exp_media_5"]).copy()
+    # mantém apenas anos com histórico suficiente (>= 2 anos anteriores)
+    df = df.dropna(subset=["prod_media_3", "exp_media_3"]).copy()
 
     def _label(r) -> int:
-        prod_maior = r["producao_total"] > r["prod_media_5"]
-        exp_maior = r["exportacao_total_usd"] > r["exp_media_5"]
+        prod_maior = r["producao_total"] > r["prod_media_3"]
+        exp_maior = r["exportacao_total_usd"] > r["exp_media_3"]
         if prod_maior and exp_maior:
             return 1
         elif prod_maior and not exp_maior:
@@ -233,8 +288,8 @@ def run_and_save_ml() -> None:
     """
     Executa o pipeline completo e registra resultados no banco:
       - lê scrape_records
-      - agrega por ano
-      - calcula desempenho
+      - agrega por ano (produção = apenas 'Vinho de Mesa')
+      - calcula desempenho (média móvel dos 3 anos anteriores)
       - salva ml_dataset
       - treina Regressão Logística
       - salva métricas em ml_metrics
@@ -245,7 +300,6 @@ def run_and_save_ml() -> None:
     # 1) carregar scrapes
     df_scrapes = _load_scrapes_df(engine)
     if df_scrapes.empty:
-        # nada a fazer
         return
 
     # 2) totais anuais
@@ -255,18 +309,26 @@ def run_and_save_ml() -> None:
 
     # 3) class labels
     ds = _add_desempenho_labels(yearly)
-    if ds.empty or len(ds) < 6:
-        # dataset insuficiente para um split 50/50
-        # ainda assim salva o dataset disponível
+    if (
+        ds.empty or len(ds) < 4
+    ):  # janela 3 => normalmente dá para trabalhar com >=4 anos após o corte
         _save_ml_dataset(engine, ds)
         return
 
     # 4) salvar dataset tratado
     _save_ml_dataset(engine, ds)
 
-    # 5) treino e avaliação
+    # 5) treino e avaliação (com guards)
     X = ds[["year", "producao_total", "exportacao_total_usd"]].values
     y = ds["desempenho"].values
+
+    classes, counts = np.unique(y, return_counts=True)
+    if classes.size < 2:
+        # salva dataset mesmo assim e encerra sem erro
+        print(
+            f"[ML] Abortado: apenas uma classe presente em y={classes.tolist()} counts={counts.tolist()}"
+        )
+        return
 
     try:
         X_train, X_test, y_train, y_test = train_test_split(
@@ -276,6 +338,15 @@ def run_and_save_ml() -> None:
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=0.5, random_state=42
         )
+
+    if np.unique(y_train).size < 2:
+        # tenta split alternativo
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.8, random_state=42
+        )
+        if np.unique(y_train).size < 2:
+            print("[ML] Abortado: mesmo após novo split, treino continua com 1 classe.")
+            return
 
     model = LogisticRegression(multi_class="multinomial", solver="lbfgs", max_iter=1000)
     model.fit(X_train, y_train)

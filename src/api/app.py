@@ -16,7 +16,7 @@ from starlette.responses import Response
 from utils.auth import router as auth_router, get_current_active_user
 
 # Banco (agora Postgres via db_utils já adaptado)
-from src.db_querys.db_utils import (
+from db_querys.db_utils import (
     init_db,
     save_scrape_results,
     query_scrape_results,
@@ -24,7 +24,7 @@ from src.db_querys.db_utils import (
 )
 
 # Job de ML separado (sem retorno; só persiste no DB)
-from src.job.ml_job import run_and_save_ml
+from job.ml_job import run_and_save_ml
 
 # Carrega references.json (mapeamento de abas/subabas → URLs)
 BASE_DIR = Path(__file__).parent
