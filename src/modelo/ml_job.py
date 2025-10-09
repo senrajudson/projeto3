@@ -1,8 +1,7 @@
-# src/ml_job.py
 import os
 import json
 from datetime import datetime
-from typing import List, Optional
+from typing import List
 
 import numpy as np
 import pandas as pd
@@ -12,19 +11,22 @@ from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import classification_report, accuracy_score, confusion_matrix
 
-# === módulos ETL novos ===
-from job.etl_job1 import run_etl_save
-from job.etl_job2 import run_etl_export_update
+from db_querys.etl_producao import (
+    extrair_dados_producao,
+    transformar_producao,
+    carregar_em_dataset_ml as carregar_producao,
+)
+from db_querys.etl_exportacao import (
+    extrair_dados_exportacao,
+    transformar_exportacao,
+    carregar_em_dataset_ml as carregar_exportacao,
+)
+from db_querys import init_db  # já existente
 
-# =========================================================
-# Config
-# =========================================================
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@db:5432/projeto3")
 
 
-# =========================================================
-# Persistência (dataset e métricas)
-# =========================================================
+# -------------------- persistência (dataset e métricas) --------------------
 def _ensure_metrics_table(engine):
     ddl = """
     CREATE TABLE IF NOT EXISTS ml_metrics (
@@ -60,16 +62,17 @@ def _save_ml_metrics(
         conn.execute(
             text(
                 """
-                 INSERT INTO ml_metrics
-                 (accuracy, confusion_matrix, classification_report, rows, created_at)
-                 VALUES (:accuracy, :confusion_matrix, :classification_report, :rows, :created_at)
-            """
+            INSERT INTO ml_metrics
+            (accuracy, confusion_matrix, classification_report, rows, created_at)
+            VALUES (:accuracy, :confusion_matrix, :classification_report, :rows, :created_at)
+        """
             ),
             payload,
         )
 
 
 def _ensure_etl_columns(engine):
+    """Garante etl_job e colunas (sem replace)."""
     with engine.begin() as conn:
         conn.execute(
             text(
@@ -105,22 +108,18 @@ def _ensure_etl_columns(engine):
         )
 
 
-# =========================================================
-# Regra ANTIGA de classificação (móvel 5 anos, usando anos anteriores)
-# =========================================================
+# -------------------- regra ANTIGA (média móvel 5 anos) --------------------
 def _classificar_regra_antiga(df_etl: pd.DataFrame) -> pd.DataFrame:
     """
-    Usa a regra antiga (média dos últimos 5 anos, olhando APENAS anos anteriores).
-    Mapeamento:
+    Regras:
       - prod > média & exp > média → 1
       - prod > média & exp < média → 0
       - prod < média & exp > média → 2
       - prod < média & exp < média → 1
-    Retorna df com coluna 'desempenho' (int).
+    Usa média móvel (5) dos ANOS ANTERIORES (shift).
     """
     df = df_etl.sort_values("year").reset_index(drop=True).copy()
 
-    # médias móveis usando SOMENTE anos anteriores (shift)
     df["prod_media_5"] = (
         df["producao_vinhos_mesa"].shift(1).rolling(window=5, min_periods=3).mean()
     )
@@ -128,7 +127,6 @@ def _classificar_regra_antiga(df_etl: pd.DataFrame) -> pd.DataFrame:
         df["exportacao_total_dols"].shift(1).rolling(window=5, min_periods=3).mean()
     )
 
-    # só classifica onde há histórico suficiente
     df = df.dropna(subset=["prod_media_5", "exp_media_5"]).copy()
 
     def _label(r) -> int:
@@ -147,91 +145,79 @@ def _classificar_regra_antiga(df_etl: pd.DataFrame) -> pd.DataFrame:
     return df[["year", "producao_vinhos_mesa", "exportacao_total_dols", "desempenho"]]
 
 
-# =========================================================
-# Job principal: executa TUDO e salva no banco (sem retorno)
-# =========================================================
 def run_and_save_ml() -> None:
     """
-    Pipeline completo:
-      - roda ETLs modulares para preencher/atualizar etl_job
-      - lê etl_job
-      - aplica REGRA ANTIGA (média móvel 5 anos) e grava 'desempenho' em etl_job
-      - monta ml_dataset (padronizando nomes de colunas)
-      - treina regressão logística e salva métricas
+    - Executa ETLs de exportação e produção (para dataset_ml)
+    - Lê dataset_ml, classifica via regra antiga e grava 'desempenho' (UPDATE por ano)
+    - Monta ml_dataset e treina regressão logística
+    - Salva métricas em ml_metrics
     """
     engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True)
+    session = init_db()
 
-    # 0) Garante schema/colunas da etl_job
-    _ensure_etl_columns(engine)
+    # 1) Executa os ETLs para a tabela dataset_ml
+    intervalo = (1980, 2023)
 
-    # 1) executa ETLs (produção e exportação)
-    #    - produção: Vinho de Mesa (litros)
-    #    - exportação: Vinhos de mesa / Países: Total (US$)
-    run_etl_save()
-    run_etl_export_update()
+    # Produção
+    df_prod = transformar_producao(extrair_dados_producao(session, intervalo))
+    carregar_producao(session, df_prod)
 
-    # 2) lê etl_job
+    # Exportação
+    df_exp = transformar_exportacao(
+        extrair_dados_exportacao(session, tab="Exportações", intervalo=intervalo)
+    )
+    carregar_exportacao(session, df_exp)
+
+    # 2) lê dataset_ml
     with engine.begin() as conn:
-        etl = pd.read_sql("SELECT * FROM etl_job ORDER BY year", conn)
+        df = pd.read_sql("SELECT * FROM dataset_ml ORDER BY ano", conn)
 
-    # precisa ao menos das 3 colunas
-    needed = {"year", "producao_vinhos_mesa", "exportacao_total_dols"}
-    if etl.empty or not needed.issubset(set(etl.columns)):
+    needed = {"ano", "producao_litros", "exportacao_total"}
+    if df.empty or not needed.issubset(df.columns):
         return
 
-    # 3) classificar com a REGRA ANTIGA
-    cls_df = _classificar_regra_antiga(etl)
+    df["producao_litros"] = pd.to_numeric(df["producao_litros"], errors="coerce")
+    df["exportacao_total"] = pd.to_numeric(df["exportacao_total"], errors="coerce")
+    df = df.dropna(subset=["producao_litros", "exportacao_total"])
 
-    # 3.1) atualiza a tabela etl_job com a coluna 'desempenho'
-    # mescla pra preservar anos que não têm histórico suficiente (ficam com NULL)
-    out_etl = etl.merge(cls_df[["year", "desempenho"]], on="year", how="left")
+    # 3) classificar
+    df_sorted = df.sort_values("ano").copy()
+    df_sorted["prod_media_5"] = (
+        df_sorted["producao_litros"].shift(1).rolling(window=5, min_periods=3).mean()
+    )
+    df_sorted["exp_media_5"] = (
+        df_sorted["exportacao_total"].shift(1).rolling(window=5, min_periods=3).mean()
+    )
+    df_sorted = df_sorted.dropna(subset=["prod_media_5", "exp_media_5"]).copy()
+
+    def _label(r) -> int:
+        prod_maior = r["producao_litros"] > r["prod_media_5"]
+        exp_maior = r["exportacao_total"] > r["exp_media_5"]
+        if prod_maior and exp_maior:
+            return 1
+        elif prod_maior and not exp_maior:
+            return 0
+        elif (not prod_maior) and exp_maior:
+            return 2
+        else:
+            return 1
+
+    df_sorted["desempenho"] = df_sorted.apply(_label, axis=1).astype(int)
+
+    # 4) atualiza dataset_ml com desempenho
     with engine.begin() as conn:
-        out_etl.to_sql("etl_job", con=conn, if_exists="replace", index=False)
-        # re-garante colunas e tipos
-        conn.execute(
-            text(
-                """
-            DO $$
-            BEGIN
-                -- garante colunas
-                IF NOT EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name='etl_job' AND column_name='exportacao_total_dols'
-                ) THEN
-                    ALTER TABLE etl_job ADD COLUMN exportacao_total_dols DOUBLE PRECISION;
-                END IF;
-
-                IF NOT EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name='etl_job' AND column_name='desempenho'
-                ) THEN
-                    ALTER TABLE etl_job ADD COLUMN desempenho INT;
-                END IF;
-
-                -- ajusta tipos das colunas que existem
-                EXECUTE 'ALTER TABLE etl_job ALTER COLUMN year TYPE INT USING year::INT';
-                IF EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name=''etl_job'' AND column_name=''producao_vinhos_mesa''
-                ) THEN
-                    EXECUTE 'ALTER TABLE etl_job ALTER COLUMN producao_vinhos_mesa TYPE DOUBLE PRECISION';
-                END IF;
-                IF EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name=''etl_job'' AND column_name=''exportacao_total_dols''
-                ) THEN
-                    EXECUTE 'ALTER TABLE etl_job ALTER COLUMN exportacao_total_dols TYPE DOUBLE PRECISION';
-                END IF;
-            END$$;
-        """
+        for _, r in df_sorted.iterrows():
+            conn.execute(
+                text("UPDATE dataset_ml SET desempenho=:d WHERE ano=:y"),
+                {"y": int(r["ano"]), "d": int(r["desempenho"])},
             )
-        )
 
-    # 4) montar ml_dataset (somente anos com rótulo disponível)
-    ds = cls_df.rename(
+    # 5) preparar dataset de treino
+    ds = df_sorted.rename(
         columns={
-            "producao_vinhos_mesa": "producao_total",
-            "exportacao_total_dols": "exportacao_total_usd",
+            "ano": "year",
+            "producao_litros": "producao_total",
+            "exportacao_total": "exportacao_total_usd",
         }
     )[["year", "producao_total", "exportacao_total_usd", "desempenho"]]
 
@@ -241,7 +227,7 @@ def run_and_save_ml() -> None:
 
     _save_ml_dataset(engine, ds)
 
-    # 5) treino e avaliação (com guards)
+    # 6) treino e avaliação
     X = ds[["year", "producao_total", "exportacao_total_usd"]].values
     y = ds["desempenho"].values
 
@@ -266,10 +252,9 @@ def run_and_save_ml() -> None:
             X, y, test_size=0.8, random_state=42
         )
         if np.unique(y_train).size < 2:
-            print("[ML] Abortado: mesmo após novo split, treino continua com 1 classe.")
+            print("[ML] Abortado: treino com 1 classe mesmo após novo split.")
             return
 
-    # remover multi_class para evitar FutureWarning (sklearn>=1.5)
     model = LogisticRegression(solver="lbfgs", max_iter=1000)
     model.fit(X_train, y_train)
     y_pred = model.predict(X_test)

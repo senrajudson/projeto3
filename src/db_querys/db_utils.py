@@ -11,6 +11,15 @@ from sqlalchemy.orm import Session, sessionmaker
 
 Base = declarative_base()
 
+class DatasetML(Base):
+    __tablename__ = "dataset_ml"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ano = Column(Integer, nullable=False, unique=True)  # assume 1 linha por ano
+    exportacao_total = Column(
+        String, nullable=True
+    )  # pode adicionar mais colunas depois
+
 
 class ScrapeRecord(Base):
     __tablename__ = "scrape_records"
