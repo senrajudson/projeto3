@@ -6,28 +6,19 @@ from typing import List
 import numpy as np
 import pandas as pd
 from sqlalchemy import create_engine, text
-
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import classification_report, accuracy_score, confusion_matrix
 
-from db_querys.etl_producao import (
-    extrair_dados_producao,
-    transformar_producao,
-    carregar_em_dataset_ml as carregar_producao,
-)
-from db_querys.etl_exportacao import (
-    extrair_dados_exportacao,
-    transformar_exportacao,
-    carregar_em_dataset_ml as carregar_exportacao,
-)
-from db_querys import init_db  # já existente
+from db_querys.etl_producao import extrair_dados_producao, transformar_producao, carregar_em_dataset_ml as carregar_producao
+from db_querys.etl_exportacao import extrair_dados_exportacao, transformar_exportacao, carregar_em_dataset_ml as carregar_exportacao
+from db_querys.db_utils import init_db
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@db:5432/projeto3")
 
 
-# -------------------- persistência (dataset e métricas) --------------------
 def _ensure_metrics_table(engine):
+    """Cria tabela de métricas de modelo se não existir."""
     ddl = """
     CREATE TABLE IF NOT EXISTS ml_metrics (
         id SERIAL PRIMARY KEY,
@@ -42,14 +33,27 @@ def _ensure_metrics_table(engine):
         conn.execute(text(ddl))
 
 
+def _ensure_predictions_table(engine):
+    """Cria tabela de comparação entre real e previsto."""
+    ddl = """
+    CREATE TABLE IF NOT EXISTS ml_predictions_vs_real (
+        year INT PRIMARY KEY,
+        real INT NOT NULL,
+        predicted INT NOT NULL
+    );
+    """
+    with engine.begin() as conn:
+        conn.execute(text(ddl))
+
+
 def _save_ml_dataset(engine, df_ds: pd.DataFrame):
+    """Salva o dataset final usado para treino do modelo."""
     with engine.begin() as conn:
         df_ds.to_sql("ml_dataset", con=conn, if_exists="replace", index=False)
 
 
-def _save_ml_metrics(
-    engine, accuracy: float, cm: List[List[int]], report: dict, rows: int
-):
+def _save_ml_metrics(engine, accuracy: float, cm: List[List[int]], report: dict, rows: int):
+    """Salva as métricas do modelo treinado."""
     _ensure_metrics_table(engine)
     payload = {
         "accuracy": accuracy,
@@ -60,166 +64,87 @@ def _save_ml_metrics(
     }
     with engine.begin() as conn:
         conn.execute(
-            text(
-                """
-            INSERT INTO ml_metrics
-            (accuracy, confusion_matrix, classification_report, rows, created_at)
+            text("""
+            INSERT INTO ml_metrics (accuracy, confusion_matrix, classification_report, rows, created_at)
             VALUES (:accuracy, :confusion_matrix, :classification_report, :rows, :created_at)
-        """
-            ),
-            payload,
+            """),
+            payload
         )
 
 
-def _ensure_etl_columns(engine):
-    """Garante etl_job e colunas (sem replace)."""
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                """
-            CREATE TABLE IF NOT EXISTS etl_job (
-                year INT PRIMARY KEY,
-                producao_vinhos_mesa DOUBLE PRECISION
-            );
-        """
-            )
-        )
-        conn.execute(
-            text(
-                """
-            DO $$
-            BEGIN
-                IF NOT EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name='etl_job' AND column_name='exportacao_total_dols'
-                ) THEN
-                    ALTER TABLE etl_job ADD COLUMN exportacao_total_dols DOUBLE PRECISION;
-                END IF;
-
-                IF NOT EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name='etl_job' AND column_name='desempenho'
-                ) THEN
-                    ALTER TABLE etl_job ADD COLUMN desempenho INT;
-                END IF;
-            END$$;
-        """
-            )
-        )
-
-
-# -------------------- regra ANTIGA (média móvel 5 anos) --------------------
-def _classificar_regra_antiga(df_etl: pd.DataFrame) -> pd.DataFrame:
+def _aplicar_regra_desempenho(df: pd.DataFrame) -> pd.DataFrame:
     """
+    Aplica regra de classificação com base em média móvel 5 anos.
     Regras:
-      - prod > média & exp > média → 1
-      - prod > média & exp < média → 0
-      - prod < média & exp > média → 2
-      - prod < média & exp < média → 1
-    Usa média móvel (5) dos ANOS ANTERIORES (shift).
+        - prod > média & exp > média → 1
+        - prod > média & exp < média → 0
+        - prod < média & exp > média → 2
+        - prod < média & exp < média → 1
     """
-    df = df_etl.sort_values("year").reset_index(drop=True).copy()
+    df_sorted = df.sort_values("ano").copy()
+    df_sorted["prod_media_5"] = df_sorted["producao_litros"].shift(1).rolling(5, min_periods=3).mean()
+    df_sorted["exp_media_5"] = df_sorted["exportacao_total"].shift(1).rolling(5, min_periods=3).mean()
+    df_sorted = df_sorted.dropna(subset=["prod_media_5", "exp_media_5"])
 
-    df["prod_media_5"] = (
-        df["producao_vinhos_mesa"].shift(1).rolling(window=5, min_periods=3).mean()
-    )
-    df["exp_media_5"] = (
-        df["exportacao_total_dols"].shift(1).rolling(window=5, min_periods=3).mean()
-    )
-
-    df = df.dropna(subset=["prod_media_5", "exp_media_5"]).copy()
-
-    def _label(r) -> int:
-        prod_maior = r["producao_vinhos_mesa"] > r["prod_media_5"]
-        exp_maior = r["exportacao_total_dols"] > r["exp_media_5"]
-        if prod_maior and exp_maior:
+    def _regra(row):
+        p_maior = row["producao_litros"] > row["prod_media_5"]
+        e_maior = row["exportacao_total"] > row["exp_media_5"]
+        if p_maior and e_maior:
             return 1
-        elif prod_maior and not exp_maior:
+        elif p_maior:
             return 0
-        elif (not prod_maior) and exp_maior:
+        elif e_maior:
             return 2
-        else:
-            return 1
+        return 1
 
-    df["desempenho"] = df.apply(_label, axis=1).astype(int)
-    return df[["year", "producao_vinhos_mesa", "exportacao_total_dols", "desempenho"]]
+    df_sorted["desempenho"] = df_sorted.apply(_regra, axis=1).astype(int)
+    return df_sorted
 
 
-def run_and_save_ml() -> None:
-    """
-    - Executa ETLs de exportação e produção (para dataset_ml)
-    - Lê dataset_ml, classifica via regra antiga e grava 'desempenho' (UPDATE por ano)
-    - Monta ml_dataset e treina regressão logística
-    - Salva métricas em ml_metrics
-    """
+def run_and_save_ml():
+    """Roda o pipeline de ETL + classificação + treino do modelo + persistência."""
     engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True)
     session = init_db()
+    _ensure_predictions_table(engine)
 
-    # 1) Executa os ETLs para a tabela dataset_ml
+    # Executa ETLs
     intervalo = (1980, 2023)
-
-    # Produção
     df_prod = transformar_producao(extrair_dados_producao(session, intervalo))
     carregar_producao(session, df_prod)
 
-    # Exportação
     df_exp = transformar_exportacao(
-        extrair_dados_exportacao(session, tab="Exportações", intervalo=intervalo)
+        extrair_dados_exportacao(session, tab="Exportacao", intervalo=intervalo)
     )
     carregar_exportacao(session, df_exp)
 
-    # 2) lê dataset_ml
+    # Carrega dataset bruto
     with engine.begin() as conn:
         df = pd.read_sql("SELECT * FROM dataset_ml ORDER BY ano", conn)
 
-    needed = {"ano", "producao_litros", "exportacao_total"}
-    if df.empty or not needed.issubset(df.columns):
+    if df.empty or not {"ano", "producao_litros", "exportacao_total"}.issubset(df.columns):
         return
 
     df["producao_litros"] = pd.to_numeric(df["producao_litros"], errors="coerce")
     df["exportacao_total"] = pd.to_numeric(df["exportacao_total"], errors="coerce")
     df = df.dropna(subset=["producao_litros", "exportacao_total"])
 
-    # 3) classificar
-    df_sorted = df.sort_values("ano").copy()
-    df_sorted["prod_media_5"] = (
-        df_sorted["producao_litros"].shift(1).rolling(window=5, min_periods=3).mean()
-    )
-    df_sorted["exp_media_5"] = (
-        df_sorted["exportacao_total"].shift(1).rolling(window=5, min_periods=3).mean()
-    )
-    df_sorted = df_sorted.dropna(subset=["prod_media_5", "exp_media_5"]).copy()
+    # Classifica via regra antiga
+    df_desemp = _aplicar_regra_desempenho(df)
 
-    def _label(r) -> int:
-        prod_maior = r["producao_litros"] > r["prod_media_5"]
-        exp_maior = r["exportacao_total"] > r["exp_media_5"]
-        if prod_maior and exp_maior:
-            return 1
-        elif prod_maior and not exp_maior:
-            return 0
-        elif (not prod_maior) and exp_maior:
-            return 2
-        else:
-            return 1
-
-    df_sorted["desempenho"] = df_sorted.apply(_label, axis=1).astype(int)
-
-    # 4) atualiza dataset_ml com desempenho
+    # Atualiza valores no dataset_ml
     with engine.begin() as conn:
-        for _, r in df_sorted.iterrows():
+        for _, r in df_desemp.iterrows():
             conn.execute(
                 text("UPDATE dataset_ml SET desempenho=:d WHERE ano=:y"),
-                {"y": int(r["ano"]), "d": int(r["desempenho"])},
+                {"y": int(r["ano"]), "d": int(r["desempenho"])}
             )
 
-    # 5) preparar dataset de treino
-    ds = df_sorted.rename(
-        columns={
-            "ano": "year",
-            "producao_litros": "producao_total",
-            "exportacao_total": "exportacao_total_usd",
-        }
-    )[["year", "producao_total", "exportacao_total_usd", "desempenho"]]
+    # Monta dataset final
+    ds = df_desemp.rename(columns={
+        "ano": "year",
+        "producao_litros": "producao_total",
+        "exportacao_total": "exportacao_total_usd"
+    })[["year", "producao_total", "exportacao_total_usd", "desempenho"]]
 
     if ds.empty or len(ds) < 6:
         _save_ml_dataset(engine, ds)
@@ -227,30 +152,21 @@ def run_and_save_ml() -> None:
 
     _save_ml_dataset(engine, ds)
 
-    # 6) treino e avaliação
+    # Treino do modelo
     X = ds[["year", "producao_total", "exportacao_total_usd"]].values
     y = ds["desempenho"].values
 
-    classes, counts = np.unique(y, return_counts=True)
-    if classes.size < 2:
-        print(
-            f"[ML] Abortado: apenas uma classe presente em y={classes.tolist()} counts={counts.tolist()}"
-        )
+    if np.unique(y).size < 2:
+        print("[ML] Abortado: apenas uma classe presente")
         return
 
     try:
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.5, random_state=42, stratify=y
-        )
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.5, random_state=42, stratify=y)
     except ValueError:
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.5, random_state=42
-        )
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.5, random_state=42)
 
     if np.unique(y_train).size < 2:
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.8, random_state=42
-        )
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.8, random_state=42)
         if np.unique(y_train).size < 2:
             print("[ML] Abortado: treino com 1 classe mesmo após novo split.")
             return
@@ -259,8 +175,18 @@ def run_and_save_ml() -> None:
     model.fit(X_train, y_train)
     y_pred = model.predict(X_test)
 
+    # Salva comparação real vs previsto
+    df_pred = pd.DataFrame({
+        "year": X_test[:, 0].astype(int),
+        "real": y_test.astype(int),
+        "predicted": y_pred.astype(int)
+    })
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM ml_predictions_vs_real"))
+        df_pred.to_sql("ml_predictions_vs_real", con=conn, if_exists="append", index=False)
+
+    # Salva métricas
     acc = float(accuracy_score(y_test, y_pred))
     cm = confusion_matrix(y_test, y_pred, labels=[0, 1, 2]).tolist()
     cr = classification_report(y_test, y_pred, labels=[0, 1, 2], output_dict=True)
-
     _save_ml_metrics(engine, acc, cm, cr, rows=len(ds))

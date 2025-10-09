@@ -11,14 +11,14 @@ from sqlalchemy.orm import Session, sessionmaker
 
 Base = declarative_base()
 
+
 class DatasetML(Base):
     __tablename__ = "dataset_ml"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    ano = Column(Integer, nullable=False, unique=True)  # assume 1 linha por ano
-    exportacao_total = Column(
-        String, nullable=True
-    )  # pode adicionar mais colunas depois
+    ano = Column(Integer, nullable=False, unique=True)
+    exportacao_total = Column(String, nullable=True)
+    producao_litros = Column(String, nullable=True)  # <-- ADICIONE ESTA LINHA
 
 
 class ScrapeRecord(Base):
@@ -65,11 +65,21 @@ def save_scrape_results(
     - subtab: nome da sub-aba (se houver), caso contrário None
     - df: DataFrame contendo todas as colunas menos 'ano', e com coluna 'ano' indicando o ano
     """
+    from sqlalchemy.exc import SQLAlchemyError
+
     try:
         records: List[ScrapeRecord] = []
         for _, row in df.iterrows():
-            # Converte todas as colunas exceto 'ano' em JSON
+            row = row.dropna(how="all")  # ignora linhas completamente vazias
+
+            # Verifica se 'ano' existe e é válido
+            if "ano" not in row or pd.isna(row["ano"]):
+                continue
+
+            # Extrai as colunas, removendo 'ano'
             row_dict: Dict[str, Any] = row.drop(labels=["ano"]).to_dict()
+
+            # Cria o objeto ScrapeRecord
             rec = ScrapeRecord(
                 tab=tab,
                 subtab=subtab,
@@ -78,10 +88,19 @@ def save_scrape_results(
             )
             records.append(rec)
 
+        # Salva no banco
         session.add_all(records)
         session.commit()
-    except SQLAlchemyError:
+
+        # Log opcional: anos salvos
+        anos_salvos = sorted(set([r.year for r in records]))
+        print(
+            f"✅ [save_scrape_results] {len(records)} registros salvos para anos: {anos_salvos}"
+        )
+
+    except SQLAlchemyError as e:
         session.rollback()
+        print(f"❌ Erro ao salvar registros no banco: {e}")
         raise
 
 

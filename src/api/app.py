@@ -56,10 +56,10 @@ app.include_router(auth_router)
 def _scrape_year_bs4(base_url: str, year: int) -> pd.DataFrame:
     """
     Extrai a tabela do ano específico a partir de uma URL base (requests + BS4).
-    Lança HTTPException(503) se der erro de rede ou timeout.
     """
     try:
-        response = requests.post(base_url, data={"ano": str(year)}, timeout=120)
+        # Alteração aqui: usamos GET e passamos o ano via `params`
+        response = requests.get(base_url, params={"ano": str(year)}, timeout=120)
         response.raise_for_status()
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Erro ao acessar Embrapa: {e}")

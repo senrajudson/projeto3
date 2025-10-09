@@ -26,6 +26,13 @@ def extrair_dados_producao(
 
 def transformar_producao(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
+        print("❌ [ETL Produção] DataFrame está vazio.")
+        return pd.DataFrame(columns=["ano", "producao_litros"])
+
+    print("🔍 [ETL Produção] Colunas disponíveis:", df.columns.tolist())
+    print("🔍 [ETL Produção] Exemplos de dados:\n", df.head())
+
+    if df.empty:
         return pd.DataFrame(columns=["ano", "producao_litros"])
 
     produtos_alvo = ["VINHO DE MESA", "VINHO FINO DE MESA (VINIFERA)"]
